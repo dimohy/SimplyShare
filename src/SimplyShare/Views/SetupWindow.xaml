@@ -1,0 +1,48 @@
+<Window x:Class="SimplyShare.Views.SetupWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="SimplyShare - 초기 설정" 
+        Height="350" Width="400"
+        WindowStartupLocation="CenterScreen"
+        ResizeMode="NoResize">
+    <Grid Margin="24">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="16"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="8"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="24"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="8"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- 타이틀 -->
+        <TextBlock Grid.Row="0" Text="SimplyShare에 오신 것을 환영합니다!" 
+                   FontSize="18" FontWeight="Bold" TextWrapping="Wrap"/>
+
+        <!-- 닉네임 -->
+        <TextBlock Grid.Row="2" Text="닉네임 (필수)" FontWeight="SemiBold"/>
+        <TextBox Grid.Row="4" x:Name="NicknameBox" 
+                 Text="{Binding Nickname, UpdateSourceTrigger=PropertyChanged}"
+                 MaxLength="20" FontSize="14" Padding="4"/>
+
+        <!-- 네트워크 대역 -->
+        <TextBlock Grid.Row="6" Text="네트워크 대역 (선택, 예: 192.168.100.*)" 
+                   FontWeight="SemiBold"/>
+        <TextBox Grid.Row="8" x:Name="NetworkRangeBox"
+                 Text="{Binding NetworkRange, UpdateSourceTrigger=PropertyChanged}"
+                 AcceptsReturn="True" Height="60" 
+                 TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"
+                 FontSize="12" Padding="4"/>
+
+        <!-- 시작 버튼 -->
+        <Button Grid.Row="10" Content="시작하기" 
+                Command="{Binding CompleteSetupCommand}"
+                HorizontalAlignment="Right" Padding="24,8"
+                FontSize="14" FontWeight="SemiBold"/>
+    </Grid>
+</Window>

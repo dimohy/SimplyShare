@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1E88E5;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#1565C0;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="arrow" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#FFFFFF;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#E3F2FD;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  
+  <!-- 배경 라운드 사각형 -->
+  <rect x="8" y="8" width="240" height="240" rx="48" ry="48" fill="url(#bg)"/>
+  
+  <!-- 공유 아이콘: 세 점과 연결선 -->
+  <!-- 상단 점 (보내는 쪽) -->
+  <circle cx="128" cy="68" r="22" fill="url(#arrow)" opacity="0.95"/>
+  <!-- 좌하 점 -->
+  <circle cx="72" cy="178" r="22" fill="url(#arrow)" opacity="0.95"/>
+  <!-- 우하 점 -->
+  <circle cx="184" cy="178" r="22" fill="url(#arrow)" opacity="0.95"/>
+  
+  <!-- 연결선 -->
+  <line x1="113" y1="84" x2="87" y2="162" stroke="white" stroke-width="6" stroke-linecap="round" opacity="0.7"/>
+  <line x1="143" y1="84" x2="169" y2="162" stroke="white" stroke-width="6" stroke-linecap="round" opacity="0.7"/>
+  <line x1="94" y1="178" x2="162" y2="178" stroke="white" stroke-width="6" stroke-linecap="round" opacity="0.7"/>
+  
+  <!-- 화살표 (상단: 바깥으로 향하는 공유 심볼) -->
+  <path d="M 128 38 L 146 56 L 134 56 L 134 75 L 122 75 L 122 56 L 110 56 Z" 
+        fill="white" opacity="0.9"/>
+</svg>

@@ -1,0 +1,222 @@
+<Window x:Class="SimplyShare.Views.ChatWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:conv="clr-namespace:SimplyShare.Converters"
+    xmlns:models="clr-namespace:SimplyShare.Models"
+        Title="{Binding Title}" Height="600" Width="450"
+        WindowStartupLocation="CenterScreen"
+        Icon="/Assets/app.ico"
+        AllowDrop="True"
+        DragEnter="Window_DragEnter"
+        DragLeave="Window_DragLeave"
+        DragOver="Window_DragOver"
+        Drop="Window_Drop"
+        Closing="Window_Closing"
+        >
+    <Window.Resources>
+        <conv:FileSizeConverter x:Key="FileSizeConverter"/>
+        <conv:BoolToColorConverter x:Key="BoolToColorConverter"/>
+        <conv:ChatMessageTemplateSelector x:Key="MessageTemplateSelector"/>
+        
+        <!-- 보낸 메시지 템플릿 -->
+        <DataTemplate x:Key="SentTextTemplate">
+            <StackPanel Margin="60,2,4,2" HorizontalAlignment="Right">
+                <Border Background="#DCF8C6" CornerRadius="10,10,2,10" Padding="10,6" 
+                        MaxWidth="300" HorizontalAlignment="Right"
+                        Tag="{Binding Text}" MouseLeftButtonDown="TextBubble_DoubleClick"
+                        Cursor="Hand">
+                    <TextBlock Text="{Binding Text}" TextWrapping="Wrap" FontSize="13"
+                               MaxHeight="100" TextTrimming="CharacterEllipsis"/>
+                </Border>
+                <TextBlock Text="{Binding Timestamp, StringFormat='{}{0:HH:mm}'}" 
+                           FontSize="9" Foreground="#AAA" HorizontalAlignment="Right" Margin="0,1,4,0"/>
+            </StackPanel>
+        </DataTemplate>
+        
+        <!-- 받은 메시지 템플릿 -->
+        <DataTemplate x:Key="ReceivedTextTemplate">
+            <StackPanel Margin="4,2,60,2" HorizontalAlignment="Left">
+                <Border Background="#F0F0F0" CornerRadius="10,10,10,2" Padding="10,6"
+                        MaxWidth="300" HorizontalAlignment="Left"
+                        Tag="{Binding Text}" MouseLeftButtonDown="TextBubble_DoubleClick"
+                        Cursor="Hand">
+                    <TextBlock Text="{Binding Text}" TextWrapping="Wrap" FontSize="13"
+                               MaxHeight="100" TextTrimming="CharacterEllipsis"/>
+                </Border>
+                <TextBlock Text="{Binding Timestamp, StringFormat='{}{0:HH:mm}'}" 
+                           FontSize="9" Foreground="#AAA" Margin="4,1,0,0"/>
+            </StackPanel>
+        </DataTemplate>
+
+        <!-- 보낸 파일 템플릿 -->
+        <DataTemplate x:Key="SentFileTemplate">
+            <StackPanel Margin="60,2,4,2" HorizontalAlignment="Right">
+                <Border Background="#DCF8C6" CornerRadius="10,10,2,10" Padding="10,6"
+                        MaxWidth="300" HorizontalAlignment="Right">
+                    <DockPanel>
+                        <TextBlock Text="📎" FontSize="18" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <StackPanel>
+                            <TextBlock Text="{Binding FileName}" FontWeight="SemiBold" FontSize="12" TextTrimming="CharacterEllipsis"/>
+                            <TextBlock Text="{Binding FileSize, Converter={StaticResource FileSizeConverter}}" 
+                                       FontSize="10" Foreground="#777"/>
+                        </StackPanel>
+                    </DockPanel>
+                </Border>
+                <TextBlock Text="{Binding Timestamp, StringFormat='{}{0:HH:mm}'}" 
+                           FontSize="9" Foreground="#AAA" HorizontalAlignment="Right" Margin="0,1,4,0"/>
+            </StackPanel>
+        </DataTemplate>
+
+        <!-- 받은 파일 템플릿 -->
+        <DataTemplate x:Key="ReceivedFileTemplate">
+            <StackPanel Margin="4,2,60,2" HorizontalAlignment="Left">
+                <Border Background="#F0F0F0" CornerRadius="10,10,10,2" Padding="10,6"
+                        MaxWidth="300" HorizontalAlignment="Left" Cursor="Hand"
+                        MouseLeftButtonDown="FileMessage_Click" Tag="{Binding FilePath}">
+                    <DockPanel>
+                        <TextBlock Text="📎" FontSize="18" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <StackPanel>
+                            <TextBlock Text="{Binding FileName}" FontWeight="SemiBold" FontSize="12" TextTrimming="CharacterEllipsis"/>
+                            <TextBlock Text="{Binding FileSize, Converter={StaticResource FileSizeConverter}}" 
+                                       FontSize="10" Foreground="#777"/>
+                            <TextBlock Text="클릭하여 열기" FontSize="9" Foreground="DodgerBlue"/>
+                        </StackPanel>
+                    </DockPanel>
+                </Border>
+                <TextBlock Text="{Binding Timestamp, StringFormat='{}{0:HH:mm}'}" 
+                           FontSize="9" Foreground="#AAA" Margin="4,1,0,0"/>
+            </StackPanel>
+        </DataTemplate>
+
+        <!-- 시스템 메시지 템플릿 -->
+        <DataTemplate x:Key="SystemTemplate">
+            <TextBlock Text="{Binding Text}" HorizontalAlignment="Center" 
+                       FontSize="10" Foreground="#AAA" Margin="0,4"/>
+        </DataTemplate>
+    </Window.Resources>
+    
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- 헤더 -->
+        <Border Grid.Row="0" Background="#F8F8F8" Padding="12,8" 
+                BorderBrush="#E0E0E0" BorderThickness="0,0,0,1">
+            <DockPanel>
+                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+                    <ComboBox Width="80" Margin="0,0,10,0"
+                              SelectedValuePath="Tag"
+                              SelectedValue="{Binding BoundarySide, Mode=TwoWay}"
+                              IsEnabled="{Binding IsBoundarySideEditable}">
+                        <ComboBoxItem Content="오른쪽" Tag="{x:Static models:BoundarySide.Right}"/>
+                        <ComboBoxItem Content="왼쪽" Tag="{x:Static models:BoundarySide.Left}"/>
+                        <ComboBoxItem Content="상단" Tag="{x:Static models:BoundarySide.Top}"/>
+                        <ComboBoxItem Content="하단" Tag="{x:Static models:BoundarySide.Bottom}"/>
+                    </ComboBox>
+                    <CheckBox Content="클립보드" Margin="0,0,10,0"
+                              IsChecked="{Binding IsClipboardSharingEnabled}"
+                              IsEnabled="{Binding IsChatConnected}"/>
+                    <CheckBox Content="입력" Margin="0,0,0,0"
+                              IsChecked="{Binding IsInputSharingEnabled}"
+                              IsEnabled="{Binding IsChatConnected}"/>
+                </StackPanel>
+                <TextBlock DockPanel.Dock="Right"
+                           Text="{Binding InputModeLabel}"
+                           Margin="0,0,10,0"
+                           Foreground="Gray"
+                           FontSize="10"
+                           VerticalAlignment="Center"/>
+                <Ellipse DockPanel.Dock="Left" Width="10" Height="10" 
+                         Fill="{Binding TargetDevice.IsOnline, Converter={StaticResource BoolToColorConverter}}"
+                         Margin="0,0,8,0" VerticalAlignment="Center"/>
+                <StackPanel>
+                    <TextBlock Text="{Binding TargetDevice.Nickname}" FontWeight="Bold" FontSize="14"/>
+                    <TextBlock Text="{Binding TargetDevice.IpAddress}" Foreground="Gray" FontSize="10"/>
+                </StackPanel>
+            </DockPanel>
+        </Border>
+
+        <!-- 메시지 목록 -->
+        <Grid Grid.Row="1">
+            <ListBox x:Name="MessageList"
+                     ItemsSource="{Binding Messages}"
+                     BorderThickness="0"
+                     ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                     ItemTemplateSelector="{StaticResource MessageTemplateSelector}"
+                     Padding="4">
+                <ListBox.ItemContainerStyle>
+                    <Style TargetType="ListBoxItem">
+                        <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+                        <Setter Property="Padding" Value="0"/>
+                        <Setter Property="Margin" Value="0"/>
+                        <Setter Property="Focusable" Value="False"/>
+                    </Style>
+                </ListBox.ItemContainerStyle>
+            </ListBox>
+
+            <!-- ↓ 스크롤 버튼 (맨 아래에 안 있을 때 표시) -->
+            <Button x:Name="ScrollToBottomButton" Visibility="Collapsed"
+                    HorizontalAlignment="Center" VerticalAlignment="Bottom"
+                    Margin="0,0,0,8" Click="ScrollToBottom_Click"
+                    Width="36" Height="36"
+                    Cursor="Hand" ToolTip="아래로 이동"
+                    Background="#CC007ACC" Foreground="White"
+                    BorderThickness="0">
+                <Button.Template>
+                    <ControlTemplate TargetType="Button">
+                        <Border Background="{TemplateBinding Background}" CornerRadius="18"
+                                Width="36" Height="36">
+                            <TextBlock Text="↓" FontSize="18" FontWeight="Bold"
+                                       HorizontalAlignment="Center" VerticalAlignment="Center"
+                                       Foreground="{TemplateBinding Foreground}"/>
+                        </Border>
+                    </ControlTemplate>
+                </Button.Template>
+            </Button>
+
+            <!-- 드래그 앤 드롭 힌트 -->
+            <Border x:Name="DropOverlay" Visibility="Collapsed"
+                    Background="#CC007ACC" IsHitTestVisible="False">
+                <TextBlock Text="파일을 여기에 놓으면 전송됩니다" 
+                           HorizontalAlignment="Center" VerticalAlignment="Center"
+                           Foreground="White" FontSize="16" FontWeight="Bold"/>
+            </Border>
+        </Grid>
+
+        <!-- 드롭 영역 안내 -->
+        <Border Grid.Row="2" Background="#F8F8F8" Padding="8,4"
+                BorderBrush="#E0E0E0" BorderThickness="0,1,0,0">
+            <TextBlock FontSize="10" Foreground="#AAA" HorizontalAlignment="Center">
+                <Run Text="파일을 드래그하여 전송 · Ctrl+Enter로 전송"/>
+            </TextBlock>
+        </Border>
+
+        <!-- 입력 영역 -->
+        <Border Grid.Row="3" Padding="8" Background="#FAFAFA"
+                BorderBrush="#E0E0E0" BorderThickness="0,1,0,0">
+            <DockPanel>
+                <Button DockPanel.Dock="Right" Content="전송" 
+                        Padding="14,8" Margin="6,0,0,0"
+                        Click="SendButton_Click"
+                        FontWeight="SemiBold" VerticalAlignment="Bottom"/>
+                <Button DockPanel.Dock="Right" Content="📎" FontSize="16"
+                        Background="Transparent" BorderThickness="0"
+                        Click="AttachFile_Click" ToolTip="파일 첨부"
+                        Cursor="Hand" Padding="4" VerticalAlignment="Bottom"/>
+                <TextBox x:Name="InputTextBox"
+                         Text="{Binding InputText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                         TextWrapping="Wrap"
+                         AcceptsReturn="True"
+                         VerticalScrollBarVisibility="Auto"
+                         MinHeight="36" MaxHeight="100"
+                         FontSize="13" Padding="8,6"
+                         BorderBrush="#DDD" BorderThickness="1"
+                         PreviewKeyDown="InputTextBox_PreviewKeyDown"/>
+            </DockPanel>
+        </Border>
+    </Grid>
+</Window>

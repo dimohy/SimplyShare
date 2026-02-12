@@ -1,0 +1,241 @@
+using System.Runtime.InteropServices;
+using SimplyShare.Core.Input;
+
+namespace SimplyShare.Core.Input;
+
+public sealed class GlobalInputHook : IDisposable
+{
+    private nint _mouseHook;
+    private nint _keyboardHook;
+    private HookProc? _mouseProc;
+    private HookProc? _keyboardProc;
+    private bool _disposed;
+
+    /// <summary>로컬 입력 차단 여부 콜백 (true면 훅에서 입력 소비)</summary>
+    public Func<bool>? ShouldBlockInput { get; set; }
+
+    public event Action<int>? KeyDown;
+    public event Action<int>? KeyUp;
+    public event Action<int, int>? MouseMove;
+    public event Action<int>? MouseWheel;
+    public event Action<int>? MouseDown;
+    public event Action<int>? MouseUp;
+
+    public void Start()
+    {
+        if (_disposed)
+            throw new ObjectDisposedException(nameof(GlobalInputHook));
+
+        if (_mouseHook != 0 || _keyboardHook != 0)
+            return;
+
+        _mouseProc = MouseHookCallback;
+        _keyboardProc = KeyboardHookCallback;
+
+        var hModule = GetModuleHandle(null);
+
+        _mouseHook = SetWindowsHookEx(WH_MOUSE_LL, _mouseProc, hModule, 0);
+        if (_mouseHook == 0)
+            throw new InvalidOperationException($"SetWindowsHookEx(WH_MOUSE_LL) 실패: {Marshal.GetLastWin32Error()}");
+
+        _keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, _keyboardProc, hModule, 0);
+        if (_keyboardHook == 0)
+        {
+            var err = Marshal.GetLastWin32Error();
+            Stop();
+            throw new InvalidOperationException($"SetWindowsHookEx(WH_KEYBOARD_LL) 실패: {err}");
+        }
+    }
+
+    public void Stop()
+    {
+        if (_mouseHook != 0)
+        {
+            UnhookWindowsHookEx(_mouseHook);
+            _mouseHook = 0;
+        }
+
+        if (_keyboardHook != 0)
+        {
+            UnhookWindowsHookEx(_keyboardHook);
+            _keyboardHook = 0;
+        }
+    }
+
+    private nint MouseHookCallback(int nCode, nint wParam, nint lParam)
+    {
+        var shouldBlock = ShouldBlockInput?.Invoke() is true;
+        var isInjectedBySimplyShare = false;
+        var msg = 0;
+
+        if (nCode >= 0)
+        {
+            try
+            {
+                var info = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
+                isInjectedBySimplyShare = info.dwExtraInfo == InputInjector.InjectedExtraInfo;
+                msg = unchecked((int)wParam);
+                switch (msg)
+                {
+                    case WM_MOUSEMOVE:
+                        // 로컬 리센터링을 위한 주입 이벤트는 무시
+                        if (!isInjectedBySimplyShare)
+                            MouseMove?.Invoke(info.pt.x, info.pt.y);
+                        break;
+                    case WM_LBUTTONDOWN:
+                        MouseDown?.Invoke(1);
+                        break;
+                    case WM_LBUTTONUP:
+                        MouseUp?.Invoke(1);
+                        break;
+                    case WM_RBUTTONDOWN:
+                        MouseDown?.Invoke(2);
+                        break;
+                    case WM_RBUTTONUP:
+                        MouseUp?.Invoke(2);
+                        break;
+                    case WM_MBUTTONDOWN:
+                        MouseDown?.Invoke(3);
+                        break;
+                    case WM_MBUTTONUP:
+                        MouseUp?.Invoke(3);
+                        break;
+                    case WM_MOUSEWHEEL:
+                        {
+                            var delta = unchecked((short)((info.mouseData >> 16) & 0xFFFF));
+                            MouseWheel?.Invoke(delta);
+                            break;
+                        }
+                }
+            }
+            catch
+            {
+                // 훅 콜백은 예외 전파 금지
+            }
+        }
+
+        if (shouldBlock && !isInjectedBySimplyShare)
+        {
+            // WM_MOUSEMOVE 포함 모든 마우스 메시지 차단.
+            // RawInputHook이 디바이스 raw delta를 직접 캡처하므로 LL 훅 통과 불필요.
+            // WM_MOUSEMOVE를 통과시키면 포커스된 WPF가 hit-test/이벤트를 처리하며
+            // UI 스레드를 폭격 → RawInput 처리 지연 + LL 키보드 훅 타임아웃 제거.
+            if (msg != WM_MOUSEMOVE)
+                CursorApi.Clear();
+            return 1;
+        }
+
+        return CallNextHookEx(0, nCode, wParam, lParam);
+    }
+
+    private nint KeyboardHookCallback(int nCode, nint wParam, nint lParam)
+    {
+        var shouldBlock = ShouldBlockInput?.Invoke() is true;
+        var isInjectedBySimplyShare = false;
+
+        if (nCode >= 0)
+        {
+            try
+            {
+                var info = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
+                isInjectedBySimplyShare = info.dwExtraInfo == InputInjector.InjectedExtraInfo;
+                var msg = unchecked((int)wParam);
+                switch (msg)
+                {
+                    case WM_KEYDOWN:
+                    case WM_SYSKEYDOWN:
+                        KeyDown?.Invoke(unchecked((int)info.vkCode));
+                        break;
+                    case WM_KEYUP:
+                    case WM_SYSKEYUP:
+                        KeyUp?.Invoke(unchecked((int)info.vkCode));
+                        break;
+                }
+            }
+            catch
+            {
+                // 훅 콜백은 예외 전파 금지
+            }
+        }
+
+        if (shouldBlock && !isInjectedBySimplyShare)
+            return 1;
+
+        return CallNextHookEx(0, nCode, wParam, lParam);
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        Stop();
+        _mouseProc = null;
+        _keyboardProc = null;
+    }
+
+    private delegate nint HookProc(int nCode, nint wParam, nint lParam);
+
+    private const int WH_MOUSE_LL = 14;
+    private const int WH_KEYBOARD_LL = 13;
+
+    private const int WM_MOUSEMOVE = 0x0200;
+    private const int WM_LBUTTONDOWN = 0x0201;
+    private const int WM_LBUTTONUP = 0x0202;
+    private const int WM_RBUTTONDOWN = 0x0204;
+    private const int WM_RBUTTONUP = 0x0205;
+    private const int WM_MBUTTONDOWN = 0x0207;
+    private const int WM_MBUTTONUP = 0x0208;
+    private const int WM_MOUSEWHEEL = 0x020A;
+
+    private const int WM_KEYDOWN = 0x0100;
+    private const int WM_KEYUP = 0x0101;
+    private const int WM_SYSKEYDOWN = 0x0104;
+    private const int WM_SYSKEYUP = 0x0105;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct POINT
+    {
+        public int x;
+        public int y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MSLLHOOKSTRUCT
+    {
+        public POINT pt;
+        public uint mouseData;
+        public uint flags;
+        public uint time;
+        public nint dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct KBDLLHOOKSTRUCT
+    {
+        public uint vkCode;
+        public uint scanCode;
+        public uint flags;
+        public uint time;
+        public nint dwExtraInfo;
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern nint SetWindowsHookEx(int idHook, HookProc lpfn, nint hMod, uint dwThreadId);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool UnhookWindowsHookEx(nint hhk);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern nint CallNextHookEx(nint hhk, int nCode, nint wParam, nint lParam);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern nint GetModuleHandle(string? lpModuleName);
+
+    private static class CursorApi
+    {
+        public static void Clear() => _ = SetCursor(nint.Zero);
+
+        [DllImport("user32.dll")]
+        private static extern nint SetCursor(nint hCursor);
+    }
+}

@@ -1,0 +1,86 @@
+﻿<Window x:Class="SimplyShare.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:local="clr-namespace:SimplyShare"
+        xmlns:conv="clr-namespace:SimplyShare.Converters"
+        mc:Ignorable="d"
+        Title="SimplyShare" Height="480" Width="340"
+        ResizeMode="NoResize"
+        WindowStartupLocation="CenterScreen"
+        Icon="Assets/app.ico"
+        StateChanged="Window_StateChanged"
+        Closing="Window_Closing">
+    <Window.Resources>
+        <conv:BoolToColorConverter x:Key="BoolToColorConverter"/>
+        <BooleanToVisibilityConverter x:Key="BoolToVisibilityConverter"/>
+    </Window.Resources>
+    
+    <Grid Margin="12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- 헤더 -->
+        <DockPanel Grid.Row="0" Margin="0,0,0,10">
+            <Button DockPanel.Dock="Right" Content="&#x2699;" FontSize="18" 
+                    Background="Transparent" BorderThickness="0"
+                    Click="SettingsButton_Click" ToolTip="설정"
+                    Cursor="Hand" Padding="8,2"/>
+            <StackPanel>
+                <StackPanel Orientation="Horizontal">
+                    <TextBlock Text="SimplyShare" FontSize="20" FontWeight="Bold"/>
+                    <TextBlock x:Name="VersionText" FontSize="11" Foreground="Gray"
+                               VerticalAlignment="Bottom" Margin="6,0,0,2"/>
+                </StackPanel>
+                <TextBlock x:Name="NicknameText" Foreground="Gray" FontSize="11" Margin="0,1,0,0"/>
+                <TextBlock x:Name="LocalIpText" Foreground="Gray" FontSize="11" Margin="0,1,0,0"/>
+            </StackPanel>
+        </DockPanel>
+
+        <!-- 장치 목록 -->
+        <ListBox Grid.Row="1" x:Name="DeviceList"
+                 ItemsSource="{Binding Devices}"
+                 BorderThickness="0"
+                 MouseDoubleClick="DeviceList_MouseDoubleClick"
+                 Padding="0">
+            <ListBox.ItemContainerStyle>
+                <Style TargetType="ListBoxItem">
+                    <Setter Property="Padding" Value="8,6"/>
+                    <Setter Property="Margin" Value="0,0,0,1"/>
+                    <Setter Property="Cursor" Value="Hand"/>
+                </Style>
+            </ListBox.ItemContainerStyle>
+            <ListBox.ItemTemplate>
+                <DataTemplate>
+                    <DockPanel>
+                        <Ellipse DockPanel.Dock="Left" Width="10" Height="10" 
+                                 Fill="{Binding IsOnline, Converter={StaticResource BoolToColorConverter}}" 
+                                 Margin="0,0,10,0" VerticalAlignment="Center"/>
+                        <StackPanel>
+                            <TextBlock Text="{Binding Nickname}" FontWeight="SemiBold" FontSize="13"/>
+                            <TextBlock Text="{Binding IpAddress}" Foreground="Gray" FontSize="10"/>
+                        </StackPanel>
+                    </DockPanel>
+                </DataTemplate>
+            </ListBox.ItemTemplate>
+        </ListBox>
+
+        <!-- 장치 없을 때 안내 -->
+        <TextBlock Grid.Row="1" 
+                   Text="같은 네트워크의 장치를 검색 중..." 
+                   HorizontalAlignment="Center" 
+                   VerticalAlignment="Center"
+                   Foreground="#BBB" FontSize="13"
+                   Visibility="{Binding HasNoDevices, Converter={StaticResource BoolToVisibilityConverter}}"/>
+
+        <!-- 상태 바 -->
+        <Border Grid.Row="2" Margin="0,8,0,0" Padding="0,6,0,0"
+                BorderBrush="#E0E0E0" BorderThickness="0,1,0,0">
+            <TextBlock Text="{Binding StatusMessage}" FontSize="10" Foreground="#999"/>
+        </Border>
+    </Grid>
+</Window>

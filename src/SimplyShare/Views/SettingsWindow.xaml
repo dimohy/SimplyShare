@@ -1,0 +1,60 @@
+<Window x:Class="SimplyShare.Views.SettingsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="SimplyShare - 설정" 
+        Height="450" Width="420"
+        WindowStartupLocation="CenterOwner"
+        ResizeMode="NoResize">
+    <Grid Margin="20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <TextBlock Grid.Row="0" Text="설정" FontSize="18" FontWeight="Bold" Margin="0,0,0,16"/>
+
+        <!-- 닉네임 -->
+        <TextBlock Grid.Row="1" Text="닉네임" FontWeight="SemiBold"/>
+        <TextBox Grid.Row="2" Text="{Binding Nickname, UpdateSourceTrigger=PropertyChanged}"
+                 Margin="0,4,0,12" Padding="4"/>
+
+        <!-- 저장 경로 -->
+        <TextBlock Grid.Row="3" Text="수신 파일 저장 경로" FontWeight="SemiBold"/>
+        <TextBox Grid.Row="4" Text="{Binding DownloadPath, UpdateSourceTrigger=PropertyChanged}"
+                 Margin="0,4,0,12" Padding="4"/>
+
+        <!-- 네트워크 대역 -->
+        <TextBlock Grid.Row="5" Text="네트워크 대역 (줄 단위, 예: 192.168.100.*)" FontWeight="SemiBold"/>
+        <TextBox Grid.Row="6" Text="{Binding NetworkRangesText, UpdateSourceTrigger=PropertyChanged}"
+                 AcceptsReturn="True" Height="60" TextWrapping="Wrap" 
+                 VerticalScrollBarVisibility="Auto"
+                 Margin="0,4,0,12" Padding="4"/>
+
+        <!-- 포트 설정 -->
+        <StackPanel Grid.Row="7" Orientation="Horizontal" Margin="0,0,0,12">
+            <TextBlock Text="Discovery 포트:" VerticalAlignment="Center" Margin="0,0,8,0"/>
+            <TextBox Text="{Binding DiscoveryPort}" Width="60" Padding="4"/>
+            <TextBlock Text="Transfer 포트:" VerticalAlignment="Center" Margin="16,0,8,0"/>
+            <TextBox Text="{Binding TransferPort}" Width="60" Padding="4"/>
+        </StackPanel>
+
+        <!-- 시작프로그램 -->
+        <CheckBox Grid.Row="8" Content="Windows 시작 시 자동 실행"
+                  IsChecked="{Binding RunAtStartup}" Margin="0,0,0,12"/>
+
+        <!-- 저장 버튼 -->
+        <Button Grid.Row="10" Content="저장" 
+                Command="{Binding SaveCommand}"
+                HorizontalAlignment="Right" Padding="24,8"
+                FontWeight="SemiBold"/>
+    </Grid>
+</Window>
