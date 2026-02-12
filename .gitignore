@@ -41,3 +41,4 @@ Desktop.ini
 
 # Publish output
 publish/**/*.zip
+publish/**/*.exe
