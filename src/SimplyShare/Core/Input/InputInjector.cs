@@ -6,32 +6,17 @@ namespace SimplyShare.Core.Input;
 public static class InputInjector
 {
     public static readonly nint InjectedExtraInfo = new(0x53485348); // 'SHSH'
+    [ThreadStatic] private static INPUT[]? _singleInputBuffer;
+    [ThreadStatic] private static INPUT[]? _batchInputBuffer;
+    private static readonly int InputStructSize = Marshal.SizeOf<INPUT>();
 
     public static void Inject(InputEvent inputEvent)
     {
         try
         {
-            switch (inputEvent.Kind)
-            {
-                case InputEventKind.MouseMove:
-                    SendMouseMove(inputEvent.Arg1, inputEvent.Arg2);
-                    break;
-                case InputEventKind.MouseDown:
-                    SendMouseButton(inputEvent.Arg1, isDown: true);
-                    break;
-                case InputEventKind.MouseUp:
-                    SendMouseButton(inputEvent.Arg1, isDown: false);
-                    break;
-                case InputEventKind.MouseWheel:
-                    SendMouseWheel(inputEvent.Arg1);
-                    break;
-                case InputEventKind.KeyDown:
-                    SendKey(inputEvent.Arg1, isDown: true);
-                    break;
-                case InputEventKind.KeyUp:
-                    SendKey(inputEvent.Arg1, isDown: false);
-                    break;
-            }
+            var input = BuildInput(inputEvent);
+            if (input.HasValue)
+                Send(input.Value);
         }
         catch (Exception ex)
         {
@@ -39,21 +24,77 @@ public static class InputInjector
         }
     }
 
-    private static void SendMouseMove(int dx, int dy)
+    public static void InjectBatch(IReadOnlyList<InputEvent> inputEvents)
+    {
+        if (inputEvents.Count == 0)
+            return;
+
+        if (inputEvents.Count == 1)
+        {
+            Inject(inputEvents[0]);
+            return;
+        }
+
+        try
+        {
+            var inputs = _batchInputBuffer;
+            if (inputs is null || inputs.Length < inputEvents.Count)
+            {
+                inputs = new INPUT[inputEvents.Count];
+                _batchInputBuffer = inputs;
+            }
+
+            var count = 0;
+            for (var i = 0; i < inputEvents.Count; i++)
+            {
+                var input = BuildInput(inputEvents[i]);
+                if (!input.HasValue)
+                    continue;
+
+                inputs[count++] = input.Value;
+            }
+
+            if (count == 0)
+                return;
+
+            var sent = SendInput((uint)count, inputs, InputStructSize);
+            if (sent == 0)
+            {
+                AppLogger.Log("InputInjector", $"SendInput 배치 실패: {Marshal.GetLastWin32Error()}");
+            }
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Log("InputInjector", $"배치 입력 주입 실패: {ex}");
+        }
+    }
+
+    private static INPUT? BuildInput(InputEvent inputEvent)
+    {
+        return inputEvent.Kind switch
+        {
+            InputEventKind.MouseMove => BuildMouseMoveInput(inputEvent.Arg1, inputEvent.Arg2),
+            InputEventKind.MouseDown => BuildMouseButtonInput(inputEvent.Arg1, true),
+            InputEventKind.MouseUp => BuildMouseButtonInput(inputEvent.Arg1, false),
+            InputEventKind.MouseWheel => BuildMouseWheelInput(inputEvent.Arg1),
+            InputEventKind.KeyDown => BuildKeyInput(inputEvent.Arg1, true),
+            InputEventKind.KeyUp => BuildKeyInput(inputEvent.Arg1, false),
+            _ => null
+        };
+    }
+
+    private static INPUT? BuildMouseMoveInput(int dx, int dy)
     {
         if (dx == 0 && dy == 0)
-            return;
+            return null;
 
-        // 상대 이동 주입은 시스템 마우스 속도/가속 영향을 크게 받아 체감이 느릴 수 있다.
-        // 따라서 현재 커서 좌표를 기준으로 목표 좌표를 계산한 뒤 ABSOLUTE로 주입한다.
         if (!GetCursorPos(out var pt))
-            return;
+            return null;
 
-        var bounds = System.Windows.Forms.SystemInformation.VirtualScreen;
+        var bounds = ScreenInfo.VirtualScreen;
         var targetX = pt.X + dx;
         var targetY = pt.Y + dy;
 
-        // VirtualScreen 범위 내로 클램프
         if (targetX < bounds.Left) targetX = bounds.Left;
         if (targetX > bounds.Right - 1) targetX = bounds.Right - 1;
         if (targetY < bounds.Top) targetY = bounds.Top;
@@ -62,7 +103,6 @@ public static class InputInjector
         var width = Math.Max(1, bounds.Width);
         var height = Math.Max(1, bounds.Height);
 
-        // 0..65535 정규화 (절대좌표)
         var normX = (int)Math.Round((targetX - bounds.Left) * 65535.0 / Math.Max(1, width - 1));
         var normY = (int)Math.Round((targetY - bounds.Top) * 65535.0 / Math.Max(1, height - 1));
 
@@ -71,7 +111,7 @@ public static class InputInjector
         if (normY < 0) normY = 0;
         if (normY > 65535) normY = 65535;
 
-        Send(new INPUT
+        return new INPUT
         {
             type = INPUT_MOUSE,
             U = new InputUnion
@@ -84,12 +124,12 @@ public static class InputInjector
                     dwExtraInfo = InjectedExtraInfo
                 }
             }
-        });
+        };
     }
 
-    private static void SendMouseWheel(int delta)
+    private static INPUT BuildMouseWheelInput(int delta)
     {
-        Send(new INPUT
+        return new INPUT
         {
             type = INPUT_MOUSE,
             U = new InputUnion
@@ -101,10 +141,10 @@ public static class InputInjector
                     dwExtraInfo = InjectedExtraInfo
                 }
             }
-        });
+        };
     }
 
-    private static void SendMouseButton(int button, bool isDown)
+    private static INPUT? BuildMouseButtonInput(int button, bool isDown)
     {
         var flag = button switch
         {
@@ -115,9 +155,9 @@ public static class InputInjector
         };
 
         if (flag == 0)
-            return;
+            return null;
 
-        Send(new INPUT
+        return new INPUT
         {
             type = INPUT_MOUSE,
             U = new InputUnion
@@ -128,15 +168,15 @@ public static class InputInjector
                     dwExtraInfo = InjectedExtraInfo
                 }
             }
-        });
+        };
     }
 
-    private static void SendKey(int virtualKey, bool isDown)
+    private static INPUT? BuildKeyInput(int virtualKey, bool isDown)
     {
         if (virtualKey is <= 0 or > 0xFFFF)
-            return;
+            return null;
 
-        Send(new INPUT
+        return new INPUT
         {
             type = INPUT_KEYBOARD,
             U = new InputUnion
@@ -148,13 +188,41 @@ public static class InputInjector
                     dwExtraInfo = InjectedExtraInfo
                 }
             }
-        });
+        };
+    }
+
+    private static void SendMouseMove(int dx, int dy)
+    {
+        var input = BuildMouseMoveInput(dx, dy);
+        if (input.HasValue)
+            Send(input.Value);
+    }
+
+    private static void SendMouseWheel(int delta)
+    {
+        Send(BuildMouseWheelInput(delta));
+    }
+
+    private static void SendMouseButton(int button, bool isDown)
+    {
+        var input = BuildMouseButtonInput(button, isDown);
+        if (input.HasValue)
+            Send(input.Value);
+    }
+
+    private static void SendKey(int virtualKey, bool isDown)
+    {
+        var input = BuildKeyInput(virtualKey, isDown);
+        if (input.HasValue)
+            Send(input.Value);
     }
 
     private static void Send(INPUT input)
     {
-        var inputs = new[] { input };
-        var sent = SendInput(1, inputs, Marshal.SizeOf<INPUT>());
+        var inputs = _singleInputBuffer ??= new INPUT[1];
+        inputs[0] = input;
+
+        var sent = SendInput(1, inputs, InputStructSize);
         if (sent == 0)
         {
             AppLogger.Log("InputInjector", $"SendInput 실패: {Marshal.GetLastWin32Error()}");

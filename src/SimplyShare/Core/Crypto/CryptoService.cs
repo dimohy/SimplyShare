@@ -84,6 +84,35 @@ public sealed class CryptoService : Services.ICryptoService, IDisposable
     }
 
     /// <summary>
+    /// 암호화 결과 길이 계산
+    /// </summary>
+    public int GetEncryptedLength(int plaintextLength)
+        => NonceSize + TagSize + plaintextLength;
+
+    /// <summary>
+    /// AES-256-GCM 암호화 (호출자가 제공한 버퍼에 직접 기록)
+    /// 출력 형식: [12B Nonce][16B Tag][N bytes 암호문]
+    /// </summary>
+    public void EncryptToBuffer(ReadOnlySpan<byte> plaintext, Span<byte> destination)
+    {
+        if (_sessionKey is null)
+            throw new InvalidOperationException("Session key not derived. Call DeriveSessionKey first.");
+
+        var requiredLength = GetEncryptedLength(plaintext.Length);
+        if (destination.Length < requiredLength)
+            throw new ArgumentException("Destination buffer is too small.", nameof(destination));
+
+        var nonce = destination[..NonceSize];
+        var tag = destination.Slice(NonceSize, TagSize);
+        var ciphertext = destination.Slice(NonceSize + TagSize, plaintext.Length);
+
+        RandomNumberGenerator.Fill(nonce);
+
+        using var aes = new AesGcm(_sessionKey, TagSize);
+        aes.Encrypt(nonce, plaintext, ciphertext, tag);
+    }
+
+    /// <summary>
     /// AES-256-GCM 복호화
     /// 입력 형식: [12B Nonce][16B Tag][N bytes 암호문]
     /// </summary>
@@ -104,6 +133,44 @@ public sealed class CryptoService : Services.ICryptoService, IDisposable
         aes.Decrypt(nonce, ciphertext, tag, plaintext);
 
         return plaintext;
+    }
+
+    /// <summary>
+    /// 복호화 결과 길이 계산
+    /// </summary>
+    public int GetDecryptedLength(int encryptedLength)
+    {
+        if (encryptedLength < NonceSize + TagSize)
+            throw new ArgumentException("Data too short to contain nonce and tag.", nameof(encryptedLength));
+
+        return encryptedLength - NonceSize - TagSize;
+    }
+
+    /// <summary>
+    /// AES-256-GCM 복호화 (호출자가 제공한 버퍼에 직접 기록)
+    /// 입력 형식: [12B Nonce][16B Tag][N bytes 암호문]
+    /// </summary>
+    public int DecryptToBuffer(ReadOnlySpan<byte> data, Span<byte> destination)
+    {
+        if (_sessionKey is null)
+            throw new InvalidOperationException("Session key not derived. Call DeriveSessionKey first.");
+
+        if (data.Length < NonceSize + TagSize)
+            throw new ArgumentException("Data too short to contain nonce and tag.", nameof(data));
+
+        var plaintextLength = data.Length - NonceSize - TagSize;
+        if (destination.Length < plaintextLength)
+            throw new ArgumentException("Destination buffer is too small.", nameof(destination));
+
+        var nonce = data[..NonceSize];
+        var tag = data.Slice(NonceSize, TagSize);
+        var ciphertext = data[(NonceSize + TagSize)..];
+        var plaintext = destination[..plaintextLength];
+
+        using var aes = new AesGcm(_sessionKey, TagSize);
+        aes.Decrypt(nonce, ciphertext, tag, plaintext);
+
+        return plaintextLength;
     }
 
     /// <summary>

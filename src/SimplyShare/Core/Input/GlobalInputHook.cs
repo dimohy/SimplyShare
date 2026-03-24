@@ -83,27 +83,34 @@ public sealed class GlobalInputHook : IDisposable
                             MouseMove?.Invoke(info.pt.x, info.pt.y);
                         break;
                     case WM_LBUTTONDOWN:
-                        MouseDown?.Invoke(1);
+                        if (!isInjectedBySimplyShare)
+                            MouseDown?.Invoke(1);
                         break;
                     case WM_LBUTTONUP:
-                        MouseUp?.Invoke(1);
+                        if (!isInjectedBySimplyShare)
+                            MouseUp?.Invoke(1);
                         break;
                     case WM_RBUTTONDOWN:
-                        MouseDown?.Invoke(2);
+                        if (!isInjectedBySimplyShare)
+                            MouseDown?.Invoke(2);
                         break;
                     case WM_RBUTTONUP:
-                        MouseUp?.Invoke(2);
+                        if (!isInjectedBySimplyShare)
+                            MouseUp?.Invoke(2);
                         break;
                     case WM_MBUTTONDOWN:
-                        MouseDown?.Invoke(3);
+                        if (!isInjectedBySimplyShare)
+                            MouseDown?.Invoke(3);
                         break;
                     case WM_MBUTTONUP:
-                        MouseUp?.Invoke(3);
+                        if (!isInjectedBySimplyShare)
+                            MouseUp?.Invoke(3);
                         break;
                     case WM_MOUSEWHEEL:
                         {
                             var delta = unchecked((short)((info.mouseData >> 16) & 0xFFFF));
-                            MouseWheel?.Invoke(delta);
+                            if (!isInjectedBySimplyShare)
+                                MouseWheel?.Invoke(delta);
                             break;
                         }
                 }
@@ -116,12 +123,6 @@ public sealed class GlobalInputHook : IDisposable
 
         if (shouldBlock && !isInjectedBySimplyShare)
         {
-            // WM_MOUSEMOVE 포함 모든 마우스 메시지 차단.
-            // RawInputHook이 디바이스 raw delta를 직접 캡처하므로 LL 훅 통과 불필요.
-            // WM_MOUSEMOVE를 통과시키면 포커스된 WPF가 hit-test/이벤트를 처리하며
-            // UI 스레드를 폭격 → RawInput 처리 지연 + LL 키보드 훅 타임아웃 제거.
-            if (msg != WM_MOUSEMOVE)
-                CursorApi.Clear();
             return 1;
         }
 
@@ -144,11 +145,13 @@ public sealed class GlobalInputHook : IDisposable
                 {
                     case WM_KEYDOWN:
                     case WM_SYSKEYDOWN:
-                        KeyDown?.Invoke(unchecked((int)info.vkCode));
+                        if (!isInjectedBySimplyShare)
+                            KeyDown?.Invoke(unchecked((int)info.vkCode));
                         break;
                     case WM_KEYUP:
                     case WM_SYSKEYUP:
-                        KeyUp?.Invoke(unchecked((int)info.vkCode));
+                        if (!isInjectedBySimplyShare)
+                            KeyUp?.Invoke(unchecked((int)info.vkCode));
                         break;
                 }
             }
@@ -231,11 +234,4 @@ public sealed class GlobalInputHook : IDisposable
     [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
     private static extern nint GetModuleHandle(string? lpModuleName);
 
-    private static class CursorApi
-    {
-        public static void Clear() => _ = SetCursor(nint.Zero);
-
-        [DllImport("user32.dll")]
-        private static extern nint SetCursor(nint hCursor);
-    }
 }

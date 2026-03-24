@@ -13,6 +13,14 @@ namespace SimplyShare.Core.Discovery;
 /// </summary>
 public sealed class DiscoveryService : Services.IDiscoveryService, IDisposable
 {
+    private const int InitialBurstCount = 3;
+    private const int InitialBurstIntervalMs = 80;
+    private const int NetworkChangeStabilizeDelayMs = 300;
+    private const int NetworkChangeBurstCount = 2;
+    private const int NetworkChangeBurstIntervalMs = 80;
+    private const int NewDeviceBurstCount = 2;
+    private const int NewDeviceBurstIntervalMs = 80;
+
     private readonly Services.ISettingsService _settingsService;
     private readonly ConcurrentDictionary<string, DeviceInfo> _devices = new();
     private UdpClient? _udpClient;
@@ -20,6 +28,7 @@ public sealed class DiscoveryService : Services.IDiscoveryService, IDisposable
     private Task? _listenTask;
     private Task? _heartbeatTask;
     private Task? _cleanupTask;
+    private CancellationTokenSource? _networkChangeResendCts;
 
     private readonly record struct BroadcastTarget(IPAddress LocalAddress, IPEndPoint BroadcastEndPoint);
 
@@ -55,10 +64,11 @@ public sealed class DiscoveryService : Services.IDiscoveryService, IDisposable
         _listenTask = ListenAsync(_cts.Token);
 
         // 초기 Discovery 발송 (3회 빠르게)
-        for (var i = 0; i < 3; i++)
+        for (var i = 0; i < InitialBurstCount; i++)
         {
             await SendMessageAsync(DiscoveryMessageType.Discovery, cancellationToken);
-            await Task.Delay(100, cancellationToken);
+            if (i < InitialBurstCount - 1)
+                await Task.Delay(InitialBurstIntervalMs, cancellationToken);
         }
 
         AppLogger.Log("Discovery", "초기 브로드캐스트 3회 완료");
@@ -75,19 +85,24 @@ public sealed class DiscoveryService : Services.IDiscoveryService, IDisposable
     {
         AppLogger.Log("Discovery", "네트워크 변경 감지! Discovery 재발송...");
 
-        // 비동기 작업을 fire-and-forget으로 처리 (이벤트 핸들러이므로)
-        var token = _cts?.Token ?? CancellationToken.None;
+        _networkChangeResendCts?.Cancel();
+        _networkChangeResendCts?.Dispose();
+
+        var linkedToken = _cts?.Token ?? CancellationToken.None;
+        _networkChangeResendCts = CancellationTokenSource.CreateLinkedTokenSource(linkedToken);
+        var token = _networkChangeResendCts.Token;
+
         _ = Task.Run(async () =>
         {
             try
             {
-                await Task.Delay(1000, token); // 네트워크 안정화 대기
+                await Task.Delay(NetworkChangeStabilizeDelayMs, token); // 네트워크 안정화 대기
 
-                for (var i = 0; i < 3; i++)
+                for (var i = 0; i < NetworkChangeBurstCount; i++)
                 {
                     await SendMessageAsync(DiscoveryMessageType.Discovery, token);
-                    if (i < 2)
-                        await Task.Delay(100, token);
+                    if (i < NetworkChangeBurstCount - 1)
+                        await Task.Delay(NetworkChangeBurstIntervalMs, token);
                 }
                 AppLogger.Log("Discovery", "네트워크 변경 후 Discovery 재발송 완료");
             }
@@ -111,6 +126,7 @@ public sealed class DiscoveryService : Services.IDiscoveryService, IDisposable
         await SendMessageAsync(DiscoveryMessageType.Goodbye, cancellationToken);
 
         _cts?.Cancel();
+        _networkChangeResendCts?.Cancel();
 
         try
         {
@@ -136,6 +152,9 @@ public sealed class DiscoveryService : Services.IDiscoveryService, IDisposable
 
         _cts?.Dispose();
         _cts = null;
+
+        _networkChangeResendCts?.Dispose();
+        _networkChangeResendCts = null;
 
         AppLogger.Log("Discovery", "종료 완료");
     }
@@ -227,22 +246,22 @@ public sealed class DiscoveryService : Services.IDiscoveryService, IDisposable
                     try
                     {
                         // 브로드캐스트 3회
-                        for (var i = 0; i < 3; i++)
+                        for (var i = 0; i < NewDeviceBurstCount; i++)
                         {
                             await SendMessageAsync(DiscoveryMessageType.Discovery, CancellationToken.None);
-                            if (i < 2)
-                                await Task.Delay(100);
+                            if (i < NewDeviceBurstCount - 1)
+                                await Task.Delay(NewDeviceBurstIntervalMs);
                         }
-                        AppLogger.Log("Discovery", "응답 브로드캐스트 3회 완료");
+                        AppLogger.Log("Discovery", $"응답 브로드캐스트 {NewDeviceBurstCount}회 완료");
 
-                        // 유니캐스트 3회 (브로드캐스트 역방향 실패 대비)
-                        for (var i = 0; i < 3; i++)
+                        // 유니캐스트 N회 (브로드캐스트 역방향 실패 대비)
+                        for (var i = 0; i < NewDeviceBurstCount; i++)
                         {
                             await SendDirectMessageAsync(DiscoveryMessageType.Discovery, senderIp, CancellationToken.None);
-                            if (i < 2)
-                                await Task.Delay(100);
+                            if (i < NewDeviceBurstCount - 1)
+                                await Task.Delay(NewDeviceBurstIntervalMs);
                         }
-                        AppLogger.Log("Discovery", $"유니캐스트 응답 3회 완료 -> {senderIp}");
+                        AppLogger.Log("Discovery", $"유니캐스트 응답 {NewDeviceBurstCount}회 완료 -> {senderIp}");
                     }
                     catch (Exception ex)
                     {

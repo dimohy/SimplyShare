@@ -1,6 +1,6 @@
 using System.Collections.ObjectModel;
 using System.IO;
-using System.Runtime.InteropServices;
+using System.Threading.Channels;
 using System.Windows.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
@@ -25,7 +25,6 @@ public sealed partial class ChatViewModel : ObservableObject
     private bool _clipboardSubscribed;
     private readonly RawInputHook _rawInputHook = new();
     private readonly GlobalInputHook _globalInputHook = new();
-    private volatile bool _suppressLocalInputCapture;
     private bool _isRemoteInputMode;
     private bool _isBeingRemoteControlled;
     private System.Drawing.Rectangle _boundaryScreenBounds;
@@ -36,17 +35,42 @@ public sealed partial class ChatViewModel : ObservableObject
     private bool _leftCtrlDown;
     private bool _rightCtrlDown;
     private bool _remoteStopInProgress;
+    private long _lastRemoteCursorActivityTick;
 
-    private readonly object _inputSendSync = new();
-    private Task _inputSendChain = Task.CompletedTask;
-    private const double MouseDeltaScale = 4.0;
-    private readonly DispatcherTimer _cursorSuppressTimer;
-    private bool _isDisposed;
-
-    private const int MouseFlushIntervalMs = 4;
+    private readonly Channel<InputEvent> _inputEventChannel = Channel.CreateUnbounded<InputEvent>(new UnboundedChannelOptions
+    {
+        SingleReader = true,
+        SingleWriter = false,
+        AllowSynchronousContinuations = false
+    });
+    private readonly CancellationTokenSource _inputSendCts = new();
+    private readonly Task _inputSendLoopTask;
+    private readonly Channel<InputEvent> _incomingInputChannel = Channel.CreateUnbounded<InputEvent>(new UnboundedChannelOptions
+    {
+        SingleReader = true,
+        SingleWriter = false,
+        AllowSynchronousContinuations = false
+    });
+    private readonly CancellationTokenSource _inputInjectCts = new();
+    private readonly Task _inputInjectLoopTask;
+    private readonly object _inputAggregateSync = new();
+    private readonly List<InputEvent> _inputBatchBuffer = [];
+    private readonly List<InputEvent> _priorityInputBatchBuffer = [];
+    private readonly List<InputEvent> _deferredMouseMoveBatchBuffer = [];
+    private readonly List<InputEvent> _incomingInjectBatchBuffer = [];
     private int _pendingMouseDx;
     private int _pendingMouseDy;
-    private int _mouseFlushQueued;
+    private int _pendingMouseTick;
+    private bool _mouseMarkerQueued;
+    private int _pendingWheelDelta;
+    private int _pendingWheelTick;
+    private bool _wheelMarkerQueued;
+    private const double MouseDeltaScale = 1.0;
+    private const int RemoteCursorActivityIntervalMs = 16;
+    private const int MaxInputBatchSize = 24;
+    private const int MaxInjectBatchSize = 48;
+    private readonly DispatcherTimer _cursorSuppressTimer;
+    private bool _isDisposed;
 
 
     private const int RemoteExitThresholdPx = 40;
@@ -116,6 +140,8 @@ public sealed partial class ChatViewModel : ObservableObject
         _transferService = transferService;
         _settingsService = settingsService;
         _clipboardService = clipboardService;
+        _inputSendLoopTask = Task.Run(() => InputSendLoopAsync(_inputSendCts.Token));
+        _inputInjectLoopTask = Task.Run(() => InputInjectLoopAsync(_inputInjectCts.Token));
 
         _transferService.ProgressChanged += HandleProgressChanged;
 
@@ -125,9 +151,9 @@ public sealed partial class ChatViewModel : ObservableObject
         _globalInputHook.KeyDown += vk => OnLocalKey(vk, isDown: true);
         _globalInputHook.KeyUp += vk => OnLocalKey(vk, isDown: false);
         _rawInputHook.MouseDelta += (dx, dy) => OnLocalMouseDelta(dx, dy);
-        _rawInputHook.MouseWheel += delta => OnLocalMouseWheel(delta);
-        _rawInputHook.MouseDown += button => OnLocalMouseButton(button, isDown: true);
-        _rawInputHook.MouseUp += button => OnLocalMouseButton(button, isDown: false);
+        _globalInputHook.MouseWheel += delta => OnLocalMouseWheel(delta);
+        _globalInputHook.MouseDown += button => OnLocalMouseButton(button, isDown: true);
+        _globalInputHook.MouseUp += button => OnLocalMouseButton(button, isDown: false);
 
         _globalInputHook.ShouldBlockInput = () =>
             IsInputSharingEnabled && ((_isRemoteInputMode && _isPeerInputSharingEnabled) || _isBeingRemoteControlled);
@@ -199,6 +225,9 @@ public sealed partial class ChatViewModel : ObservableObject
 
     /// <summary>원격 제어 상태 변화(피제어 상태 포함) — UI 표시용</summary>
     public event Action<bool>? RemoteControlStateChanged;
+
+    /// <summary>내가 원격 제어 중인지(제어측) 상태 변화 — UI 최적화용</summary>
+    public event Action<bool>? RemoteInputModeChanged;
 
     /// <summary>원격 커서 활동(피제어 측) — 오버레이 갱신용</summary>
     public event Action? RemoteCursorActivity;
@@ -421,30 +450,7 @@ public sealed partial class ChatViewModel : ObservableObject
             return;
 
         SetBeingRemoteControlled(true);
-
-        _suppressLocalInputCapture = true;
-        try
-        {
-            InputInjector.Inject(inputEvent);
-
-            if (inputEvent.Kind is InputEventKind.MouseMove)
-            {
-                TryTriggerRemoteBoundaryReturn(inputEvent.Arg1, inputEvent.Arg2);
-            }
-
-            if (inputEvent.Kind is InputEventKind.MouseMove or InputEventKind.MouseDown or InputEventKind.MouseUp or InputEventKind.MouseWheel)
-            {
-                RemoteCursorActivity?.Invoke();
-            }
-        }
-        finally
-        {
-            // 재귀/루프 방지를 위해 약간의 시간 동안만 억제
-            _ = Task.Delay(60).ContinueWith(_ => _suppressLocalInputCapture = false,
-                CancellationToken.None,
-                TaskContinuationOptions.ExecuteSynchronously,
-                TaskScheduler.Default);
-        }
+        _incomingInputChannel.Writer.TryWrite(inputEvent);
     }
 
     private void TryTriggerRemoteBoundaryReturn(int dx, int dy)
@@ -606,6 +612,7 @@ public sealed partial class ChatViewModel : ObservableObject
         CursorVisibility.Hide();
         _cursorSuppressTimer.Start();
         InputModeLabel = "입력 모드: 원격";
+        RemoteInputModeChanged?.Invoke(true);
     }
 
     private void ExitRemoteMode()
@@ -614,17 +621,18 @@ public sealed partial class ChatViewModel : ObservableObject
             return;
 
         _isRemoteInputMode = false;
-        Interlocked.Exchange(ref _pendingMouseDx, 0);
-        Interlocked.Exchange(ref _pendingMouseDy, 0);
-        Interlocked.Exchange(ref _mouseFlushQueued, 0);
         _cursorSuppressTimer.Stop();
         CursorClipper.Release();
         CursorVisibility.Show();
         InputModeLabel = "입력 모드: 로컬";
+        RemoteInputModeChanged?.Invoke(false);
     }
 
     private void OnLocalKey(int vk, bool isDown)
     {
+        if (_isBeingRemoteControlled)
+            return;
+
         // Ctrl 상태 추적
         if (vk == 0xA2) _leftCtrlDown = isDown;   // LCtrl
         if (vk == 0xA3) _rightCtrlDown = isDown;  // RCtrl
@@ -638,9 +646,6 @@ public sealed partial class ChatViewModel : ObservableObject
             return;
         }
 
-        if (_suppressLocalInputCapture)
-            return;
-
         if (!IsInputSharingEnabled || !IsChatConnected)
             return;
 
@@ -651,13 +656,14 @@ public sealed partial class ChatViewModel : ObservableObject
         EnqueueInputEvent(new InputEvent
         {
             Kind = isDown ? InputEventKind.KeyDown : InputEventKind.KeyUp,
-            Arg1 = vk
+            Arg1 = vk,
+            Arg3 = Environment.TickCount
         });
     }
 
     private void OnLocalMouseDelta(int dx, int dy)
     {
-        if (_suppressLocalInputCapture)
+        if (_isBeingRemoteControlled)
             return;
 
         if (!IsInputSharingEnabled || !IsChatConnected)
@@ -677,8 +683,6 @@ public sealed partial class ChatViewModel : ObservableObject
             return;
         }
 
-        NativeCursor.ClearCursorHandle();
-
         // 복귀 판정은 피제어 측(상대)에서 경계 도달 시 RemoteControlStop을 보내도록 한다.
 
         var now = Environment.TickCount64;
@@ -695,54 +699,13 @@ public sealed partial class ChatViewModel : ObservableObject
         if (scaledDx == 0 && scaledDy == 0)
             return;
 
-        QueueMouseMove(scaledDx, scaledDy);
-    }
-
-    private void QueueMouseMove(int dx, int dy)
-    {
-        if (dx == 0 && dy == 0)
-            return;
-
-        Interlocked.Add(ref _pendingMouseDx, dx);
-        Interlocked.Add(ref _pendingMouseDy, dy);
-
-        // 이미 플러시 예약이 되어있으면 누적만 하고 종료
-        if (Interlocked.Exchange(ref _mouseFlushQueued, 1) != 0)
-            return;
-
-        _ = Task.Delay(MouseFlushIntervalMs).ContinueWith(
-            async _ =>
-            {
-                try
-                {
-                    var flushDx = Interlocked.Exchange(ref _pendingMouseDx, 0);
-                    var flushDy = Interlocked.Exchange(ref _pendingMouseDy, 0);
-                    Interlocked.Exchange(ref _mouseFlushQueued, 0);
-
-                    if (flushDx == 0 && flushDy == 0)
-                        return;
-
-                    // 원격 모드/연결/로컬 토글이 유지될 때만 전송
-                    if (!_isRemoteInputMode || !IsChatConnected || !IsInputSharingEnabled)
-                        return;
-
-                    await SendInputEventAsync(new InputEvent
-                    {
-                        Kind = InputEventKind.MouseMove,
-                        Arg1 = flushDx,
-                        Arg2 = flushDy
-                    }, CancellationToken.None);
-                }
-                catch (Exception ex)
-                {
-                    AppLogger.Log("ChatVM", $"마우스 이동 전송 실패: {ex.Message}");
-                    Interlocked.Exchange(ref _mouseFlushQueued, 0);
-                }
-            },
-            CancellationToken.None,
-            TaskContinuationOptions.None,
-            TaskScheduler.Default)
-            .Unwrap();
+        EnqueueInputEvent(new InputEvent
+        {
+            Kind = InputEventKind.MouseMove,
+            Arg1 = scaledDx,
+            Arg2 = scaledDy,
+            Arg3 = Environment.TickCount
+        });
     }
 
     private bool ShouldEnterRemoteMode(int dx, int dy, int cursorX, int cursorY)
@@ -770,7 +733,7 @@ public sealed partial class ChatViewModel : ObservableObject
 
     private void OnLocalMouseWheel(int delta)
     {
-        if (_suppressLocalInputCapture)
+        if (_isBeingRemoteControlled)
             return;
 
         if (!IsInputSharingEnabled || !IsChatConnected)
@@ -782,13 +745,14 @@ public sealed partial class ChatViewModel : ObservableObject
         EnqueueInputEvent(new InputEvent
         {
             Kind = InputEventKind.MouseWheel,
-            Arg1 = delta
+            Arg1 = delta,
+            Arg3 = Environment.TickCount
         });
     }
 
     private void OnLocalMouseButton(int button, bool isDown)
     {
-        if (_suppressLocalInputCapture)
+        if (_isBeingRemoteControlled)
             return;
 
         if (!IsInputSharingEnabled || !IsChatConnected)
@@ -800,94 +764,9 @@ public sealed partial class ChatViewModel : ObservableObject
         EnqueueInputEvent(new InputEvent
         {
             Kind = isDown ? InputEventKind.MouseDown : InputEventKind.MouseUp,
-            Arg1 = button
+            Arg1 = button,
+            Arg3 = Environment.TickCount
         });
-    }
-
-    private static class NativeCursor
-    {
-        public static bool TryGetCursorPosition(out int x, out int y)
-        {
-            if (GetCursorPos(out var pt))
-            {
-                x = pt.x;
-                y = pt.y;
-                return true;
-            }
-
-            x = 0;
-            y = 0;
-            return false;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct POINT
-        {
-            public int x;
-            public int y;
-        }
-
-        [DllImport("user32.dll")]
-        private static extern bool GetCursorPos(out POINT lpPoint);
-
-        public static void ClearCursorHandle()
-        {
-            _ = SetCursor(nint.Zero);
-        }
-
-        [DllImport("user32.dll")]
-        private static extern nint SetCursor(nint hCursor);
-    }
-
-    private static class CursorVisibility
-    {
-        private static int _hideDepth;
-
-        public static void Hide()
-        {
-            if (_hideDepth++ > 0)
-                return;
-
-            try
-            {
-                // ShowCursor 카운터를 음수로 만들어 실제 커서 숨김
-                while (ShowCursor(false) >= 0)
-                {
-                    // no-op
-                }
-            }
-            catch
-            {
-                // ignore
-            }
-        }
-
-        public static void Show()
-        {
-            if (_hideDepth <= 0)
-            {
-                _hideDepth = 0;
-                return;
-            }
-
-            if (--_hideDepth > 0)
-                return;
-
-            try
-            {
-                while (ShowCursor(true) < 0)
-                {
-                    // no-op
-                }
-            }
-            catch
-            {
-                // ignore
-            }
-        }
-
-        [DllImport("user32.dll")]
-        private static extern int ShowCursor(bool bShow);
     }
 
     private void OnLocalClipboardTextChanged(string text)
@@ -980,6 +859,21 @@ public sealed partial class ChatViewModel : ObservableObject
             _cursorSuppressTimer.Stop();
             CursorClipper.Release();
             CursorVisibility.Show();
+            _inputSendCts.Cancel();
+            _inputInjectCts.Cancel();
+            _inputEventChannel.Writer.TryComplete();
+            _incomingInputChannel.Writer.TryComplete();
+
+            try
+            {
+                await _inputSendLoopTask;
+                await _inputInjectLoopTask;
+            }
+            catch (OperationCanceledException)
+            {
+                // 정상 종료
+            }
+
             _rawInputHook.Stop();
             _globalInputHook.Stop();
 
@@ -1046,27 +940,259 @@ public sealed partial class ChatViewModel : ObservableObject
             cancellationToken);
     }
 
+    public Task SendInputEventsAsync(IReadOnlyList<InputEvent> inputEvents, CancellationToken cancellationToken = default)
+    {
+        if (!IsInputSharingEnabled)
+            return Task.CompletedTask;
+
+        if (_chatConnection is not { IsConnected: true })
+            return Task.CompletedTask;
+
+        var settings = _settingsService.Settings;
+        return _chatConnection.SendInputEventsAsync(
+            inputEvents,
+            settings.Nickname,
+            settings.DeviceId,
+            settings.TransferPort,
+            cancellationToken);
+    }
+
     private void EnqueueInputEvent(InputEvent inputEvent)
     {
-        lock (_inputSendSync)
+        if (_isDisposed)
+            return;
+
+        if (inputEvent.Kind is InputEventKind.MouseMove)
         {
-            _inputSendChain = _inputSendChain.ContinueWith(
-                    async _ =>
-                    {
-                        try
-                        {
-                            await SendInputEventAsync(inputEvent, CancellationToken.None);
-                        }
-                        catch (Exception ex)
-                        {
-                            AppLogger.Log("ChatVM", $"입력 이벤트 전송 실패: {ex.Message}");
-                        }
-                    },
-                    CancellationToken.None,
-                    TaskContinuationOptions.None,
-                    TaskScheduler.Default)
-                .Unwrap();
+            lock (_inputAggregateSync)
+            {
+                _pendingMouseDx += inputEvent.Arg1;
+                _pendingMouseDy += inputEvent.Arg2;
+                _pendingMouseTick = inputEvent.Arg3;
+
+                if (_mouseMarkerQueued)
+                    return;
+
+                _mouseMarkerQueued = true;
+            }
+
+            _inputEventChannel.Writer.TryWrite(new InputEvent { Kind = InputEventKind.MouseMove });
+            return;
         }
+
+        if (inputEvent.Kind is InputEventKind.MouseWheel)
+        {
+            lock (_inputAggregateSync)
+            {
+                _pendingWheelDelta += inputEvent.Arg1;
+                _pendingWheelTick = inputEvent.Arg3;
+
+                if (_wheelMarkerQueued)
+                    return;
+
+                _wheelMarkerQueued = true;
+            }
+
+            _inputEventChannel.Writer.TryWrite(new InputEvent { Kind = InputEventKind.MouseWheel });
+            return;
+        }
+
+        _inputEventChannel.Writer.TryWrite(inputEvent);
+    }
+
+    private async Task InputSendLoopAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await foreach (var queuedEvent in _inputEventChannel.Reader.ReadAllAsync(cancellationToken))
+            {
+                _inputBatchBuffer.Clear();
+
+                if (TryMaterializeInputEvent(queuedEvent, out var firstEvent))
+                    _inputBatchBuffer.Add(firstEvent);
+
+                while (_inputBatchBuffer.Count < MaxInputBatchSize && _inputEventChannel.Reader.TryRead(out var nextQueued))
+                {
+                    if (TryMaterializeInputEvent(nextQueued, out var nextEvent))
+                        _inputBatchBuffer.Add(nextEvent);
+                }
+
+                if (_inputBatchBuffer.Count == 0)
+                    continue;
+
+                PrioritizeInputBatchInPlace(_inputBatchBuffer);
+
+                try
+                {
+                    if (_inputBatchBuffer.Count == 1)
+                        await SendInputEventAsync(_inputBatchBuffer[0], cancellationToken);
+                    else
+                        await SendInputEventsAsync(_inputBatchBuffer, cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    AppLogger.Log("ChatVM", $"입력 이벤트 전송 실패: {ex.Message}");
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // 정상 종료
+        }
+    }
+
+    private async Task InputInjectLoopAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await foreach (var inputEvent in _incomingInputChannel.Reader.ReadAllAsync(cancellationToken))
+            {
+                if (!CanInputShare)
+                    continue;
+
+                _incomingInjectBatchBuffer.Clear();
+                _incomingInjectBatchBuffer.Add(inputEvent);
+
+                while (_incomingInjectBatchBuffer.Count < MaxInjectBatchSize &&
+                       _incomingInputChannel.Reader.TryRead(out var nextInputEvent))
+                {
+                    _incomingInjectBatchBuffer.Add(nextInputEvent);
+                }
+
+                PrioritizeInputBatchInPlace(_incomingInjectBatchBuffer);
+
+                try
+                {
+                    InputInjector.InjectBatch(_incomingInjectBatchBuffer);
+
+                    var moveDx = 0;
+                    var moveDy = 0;
+                    var hasMouseMove = false;
+
+                    for (var i = 0; i < _incomingInjectBatchBuffer.Count; i++)
+                    {
+                        var item = _incomingInjectBatchBuffer[i];
+                        if (item.Kind is InputEventKind.MouseMove)
+                        {
+                            hasMouseMove = true;
+                            moveDx += item.Arg1;
+                            moveDy += item.Arg2;
+                        }
+                    }
+
+                    if (hasMouseMove)
+                    {
+                        TryTriggerRemoteBoundaryReturn(moveDx, moveDy);
+
+                        var nowTick = Environment.TickCount64;
+                        var lastTick = Interlocked.Read(ref _lastRemoteCursorActivityTick);
+                        if (nowTick - lastTick >= RemoteCursorActivityIntervalMs)
+                        {
+                            if (Interlocked.CompareExchange(ref _lastRemoteCursorActivityTick, nowTick, lastTick) == lastTick)
+                            {
+                                RemoteCursorActivity?.Invoke();
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    AppLogger.Log("ChatVM", $"수신 입력 배치 주입 실패: {ex.Message}");
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // 정상 종료
+        }
+    }
+
+    private void PrioritizeInputBatchInPlace(List<InputEvent> batch)
+    {
+        if (batch.Count <= 1)
+            return;
+
+        _priorityInputBatchBuffer.Clear();
+        _deferredMouseMoveBatchBuffer.Clear();
+
+        for (var i = 0; i < batch.Count; i++)
+        {
+            var inputEvent = batch[i];
+            if (inputEvent.Kind is InputEventKind.MouseMove)
+                _deferredMouseMoveBatchBuffer.Add(inputEvent);
+            else
+                _priorityInputBatchBuffer.Add(inputEvent);
+        }
+
+        if (_deferredMouseMoveBatchBuffer.Count == 0 || _priorityInputBatchBuffer.Count == 0)
+            return;
+
+        batch.Clear();
+        batch.AddRange(_priorityInputBatchBuffer);
+        batch.AddRange(_deferredMouseMoveBatchBuffer);
+    }
+
+    private bool TryMaterializeInputEvent(InputEvent queuedEvent, out InputEvent eventToSend)
+    {
+        eventToSend = queuedEvent;
+
+        if (queuedEvent.Kind is InputEventKind.MouseMove)
+        {
+            lock (_inputAggregateSync)
+            {
+                if (_pendingMouseDx == 0 && _pendingMouseDy == 0)
+                {
+                    _mouseMarkerQueued = false;
+                    return false;
+                }
+
+                eventToSend = new InputEvent
+                {
+                    Kind = InputEventKind.MouseMove,
+                    Arg1 = _pendingMouseDx,
+                    Arg2 = _pendingMouseDy,
+                    Arg3 = _pendingMouseTick
+                };
+
+                _pendingMouseDx = 0;
+                _pendingMouseDy = 0;
+                _pendingMouseTick = 0;
+                _mouseMarkerQueued = false;
+            }
+
+            return true;
+        }
+
+        if (queuedEvent.Kind is InputEventKind.MouseWheel)
+        {
+            lock (_inputAggregateSync)
+            {
+                if (_pendingWheelDelta == 0)
+                {
+                    _wheelMarkerQueued = false;
+                    return false;
+                }
+
+                eventToSend = new InputEvent
+                {
+                    Kind = InputEventKind.MouseWheel,
+                    Arg1 = _pendingWheelDelta,
+                    Arg3 = _pendingWheelTick
+                };
+
+                _pendingWheelDelta = 0;
+                _pendingWheelTick = 0;
+                _wheelMarkerQueued = false;
+            }
+
+            return true;
+        }
+
+        return true;
     }
 
     /// <summary>텍스트 전송 — ChatConnection 우선, 없으면 per-message TCP</summary>

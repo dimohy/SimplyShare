@@ -2,42 +2,77 @@
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net10.0-windows</TargetFramework>
+    <TargetFramework>net10.0-windows7.0</TargetFramework>
     <LangVersion>14</LangVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <UseWPF>true</UseWPF>
-    <UseWindowsForms>true</UseWindowsForms>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <RootNamespace>SimplyShare</RootNamespace>
     <AssemblyName>SimplyShare</AssemblyName>
-    <Version>1.0.44</Version>
+    <Version>1.0.65</Version>
     <ApplicationIcon>Assets\app.ico</ApplicationIcon>
 
-    <!-- 배포: ReadyToRun + 단일 파일 (Self-Contained) -->
+    <!-- 배포: NativeAOT + Size 최적화 -->
+    <PublishAot>true</PublishAot>
     <SelfContained>true</SelfContained>
-    <PublishSingleFile>true</PublishSingleFile>
-    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
-    <PublishReadyToRun>true</PublishReadyToRun>
+    <PublishTrimmed>true</PublishTrimmed>
+    <StripSymbols>true</StripSymbols>
+    <OptimizationPreference>Size</OptimizationPreference>
+    <InvariantGlobalization>true</InvariantGlobalization>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
-    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
 
     <!-- JSON Source Generator (리플렉션 최소화) -->
     <JsonSerializerIsReflectionEnabledByDefault>false</JsonSerializerIsReflectionEnabledByDefault>
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- MVVM (Source Generator 기반, AOT 호환) -->
-    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.*" />
-
     <!-- DI -->
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.*" />
   </ItemGroup>
 
   <ItemGroup>
-    <Resource Include="Assets\app.ico" />
+    <ProjectReference Include="..\..\..\Duxel\src\Duxel.Windows.App\Duxel.Windows.App.csproj" />
+    <ProjectReference Include="..\..\..\Duxel\src\Duxel.Core\Duxel.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Assets\app.ico" LogicalName="app.ico" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="App.xaml.cs" />
+    <Compile Remove="AssemblyInfo.cs" />
+    <Compile Remove="GlobalUsings.cs" />
+    <Compile Remove="MainWindow.xaml.cs" />
+    <Compile Remove="Converters\**\*.cs" />
+    <Compile Remove="Core\Clipboard\ClipboardWatcher.cs" />
+    <Compile Remove="Services\NotificationService.cs" />
+    <Compile Remove="ViewModels\**\*.cs" />
+    <Compile Remove="Views\**\*.cs" />
   </ItemGroup>
 
 </Project>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

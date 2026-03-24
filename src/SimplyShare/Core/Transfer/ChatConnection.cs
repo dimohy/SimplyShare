@@ -2,6 +2,8 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
+using System.Buffers.Binary;
+using System.Buffers;
 using SimplyShare.Core.Crypto;
 using SimplyShare.Models;
 
@@ -13,6 +15,15 @@ namespace SimplyShare.Core.Transfer;
 /// </summary>
 public sealed class ChatConnection : IDisposable
 {
+    private static readonly ArrayPool<byte> BufferPool = ArrayPool<byte>.Shared;
+
+    private enum ChatFrameKind : byte
+    {
+        TransferRequestJson = 1,
+        InputEventBinary = 2,
+        InputEventBatchBinary = 3
+    }
+
     private readonly TcpClient _client;
     private readonly NetworkStream _stream;
     private readonly CryptoService _crypto;
@@ -124,19 +135,53 @@ public sealed class ChatConnection : IDisposable
         int senderPort,
         CancellationToken cancellationToken = default)
     {
-        var jsonPayload = JsonSerializer.Serialize(inputEvent, AppJsonContext.Default.InputEvent);
+        _ = senderNickname;
+        _ = senderDeviceId;
+        _ = senderPort;
 
-        var request = new TransferRequest
+        var frame = new byte[1 + 1 + 4 + 4 + 4];
+        frame[0] = (byte)ChatFrameKind.InputEventBinary;
+        frame[1] = (byte)inputEvent.Kind;
+        BinaryPrimitives.WriteInt32LittleEndian(frame.AsSpan(2, 4), inputEvent.Arg1);
+        BinaryPrimitives.WriteInt32LittleEndian(frame.AsSpan(6, 4), inputEvent.Arg2);
+        BinaryPrimitives.WriteInt32LittleEndian(frame.AsSpan(10, 4), inputEvent.Arg3);
+        return SendFrameAsync(frame, cancellationToken);
+    }
+
+    public Task SendInputEventsAsync(
+        IReadOnlyList<InputEvent> inputEvents,
+        string senderNickname,
+        string senderDeviceId,
+        int senderPort,
+        CancellationToken cancellationToken = default)
+    {
+        _ = senderNickname;
+        _ = senderDeviceId;
+        _ = senderPort;
+
+        if (inputEvents.Count <= 0)
+            return Task.CompletedTask;
+
+        if (inputEvents.Count == 1)
+            return SendInputEventAsync(inputEvents[0], senderNickname, senderDeviceId, senderPort, cancellationToken);
+
+        var count = inputEvents.Count > byte.MaxValue ? byte.MaxValue : inputEvents.Count;
+        var frame = new byte[1 + 1 + (count * (1 + 4 + 4 + 4))];
+        frame[0] = (byte)ChatFrameKind.InputEventBatchBinary;
+        frame[1] = (byte)count;
+
+        var offset = 2;
+        for (var i = 0; i < count; i++)
         {
-            Type = TransferType.InputEvent,
-            SenderNickname = senderNickname,
-            SenderDeviceId = senderDeviceId,
-            SenderPort = senderPort,
-            TextContent = jsonPayload,
-            TotalSize = Encoding.UTF8.GetByteCount(jsonPayload)
-        };
+            var inputEvent = inputEvents[i];
+            frame[offset] = (byte)inputEvent.Kind;
+            BinaryPrimitives.WriteInt32LittleEndian(frame.AsSpan(offset + 1, 4), inputEvent.Arg1);
+            BinaryPrimitives.WriteInt32LittleEndian(frame.AsSpan(offset + 5, 4), inputEvent.Arg2);
+            BinaryPrimitives.WriteInt32LittleEndian(frame.AsSpan(offset + 9, 4), inputEvent.Arg3);
+            offset += 13;
+        }
 
-        return SendRequestAsync(request, cancellationToken);
+        return SendFrameAsync(frame, cancellationToken);
     }
 
     public Task SendChatConfigAsync(
@@ -241,17 +286,35 @@ public sealed class ChatConnection : IDisposable
     private async Task SendRequestAsync(TransferRequest request, CancellationToken cancellationToken)
     {
         var json = JsonSerializer.Serialize(request, AppJsonContext.Default.TransferRequest);
-        var plainBytes = Encoding.UTF8.GetBytes(json);
-        var encrypted = _crypto.Encrypt(plainBytes);
+        var jsonBytes = Encoding.UTF8.GetBytes(json);
+        var frame = new byte[1 + jsonBytes.Length];
+        frame[0] = (byte)ChatFrameKind.TransferRequestJson;
+        Buffer.BlockCopy(jsonBytes, 0, frame, 1, jsonBytes.Length);
+        await SendFrameAsync(frame, cancellationToken);
+    }
 
-        await _writeLock.WaitAsync(cancellationToken);
+    private async Task SendFrameAsync(byte[] frame, CancellationToken cancellationToken)
+    {
+        var encryptedLength = _crypto.GetEncryptedLength(frame.Length);
+        var encryptedBuffer = BufferPool.Rent(encryptedLength);
+
         try
         {
-            await SendRawAsync(encrypted, cancellationToken);
+            _crypto.EncryptToBuffer(frame, encryptedBuffer.AsSpan(0, encryptedLength));
+
+            await _writeLock.WaitAsync(cancellationToken);
+            try
+            {
+                await SendRawAsync(encryptedBuffer.AsMemory(0, encryptedLength), cancellationToken);
+            }
+            finally
+            {
+                _writeLock.Release();
+            }
         }
         finally
         {
-            _writeLock.Release();
+            BufferPool.Return(encryptedBuffer);
         }
     }
 
@@ -261,58 +324,132 @@ public sealed class ChatConnection : IDisposable
         {
             while (!cancellationToken.IsCancellationRequested)
             {
-                var encrypted = await ReadRawAsync(cancellationToken);
-                var decrypted = _crypto.Decrypt(encrypted);
-                var json = Encoding.UTF8.GetString(decrypted);
-                var request = JsonSerializer.Deserialize(json, AppJsonContext.Default.TransferRequest);
+                var encrypted = await ReadRawPooledAsync(cancellationToken);
+                var encryptedBuffer = encrypted.Buffer;
+                var encryptedLength = encrypted.Length;
 
-                if (request is null)
-                    continue;
+                var decryptedLength = _crypto.GetDecryptedLength(encryptedLength);
+                var decryptedBuffer = BufferPool.Rent(decryptedLength);
 
-                switch (request.Type)
+                try
                 {
-                    case TransferType.Text when request.TextContent is not null:
-                        TextReceived?.Invoke(request.SenderNickname, request.SenderDeviceId, request.TextContent);
-                        break;
-                    case TransferType.ClipboardText when request.TextContent is not null:
-                        ClipboardTextReceived?.Invoke(request.SenderNickname, request.SenderDeviceId, request.TextContent);
-                        break;
-                    case TransferType.ChatCloseRequest:
-                        ChatCloseRequested?.Invoke();
-                        break;
-                    case TransferType.ChatCloseAccept:
-                        ChatCloseResponded?.Invoke(true);
-                        break;
-                    case TransferType.ChatCloseReject:
-                        ChatCloseResponded?.Invoke(false);
-                        break;
-                    case TransferType.RemoteControlStop:
-                        RemoteControlStopReceived?.Invoke();
-                        break;
-                    case TransferType.InputEvent when request.TextContent is not null:
-                        {
-                            var inputEvent = JsonSerializer.Deserialize(request.TextContent, AppJsonContext.Default.InputEvent);
-                            if (inputEvent is not null)
+                    _ = _crypto.DecryptToBuffer(
+                        encryptedBuffer.AsSpan(0, encryptedLength),
+                        decryptedBuffer.AsSpan(0, decryptedLength));
+                }
+                finally
+                {
+                    BufferPool.Return(encryptedBuffer);
+                }
+
+                var decrypted = decryptedBuffer.AsSpan(0, decryptedLength);
+
+                try
+                {
+                    if (decrypted.Length < 1)
+                        continue;
+
+                    var frameKind = (ChatFrameKind)decrypted[0];
+                    switch (frameKind)
+                    {
+                        case ChatFrameKind.TransferRequestJson:
+                            {
+                                var requestPayload = Encoding.UTF8.GetString(decrypted[1..]);
+                                var request = JsonSerializer.Deserialize(requestPayload, AppJsonContext.Default.TransferRequest);
+                                if (request is null)
+                                    break;
+
+                                switch (request.Type)
+                                {
+                                    case TransferType.Text when request.TextContent is not null:
+                                        TextReceived?.Invoke(request.SenderNickname, request.SenderDeviceId, request.TextContent);
+                                        break;
+                                    case TransferType.ClipboardText when request.TextContent is not null:
+                                        ClipboardTextReceived?.Invoke(request.SenderNickname, request.SenderDeviceId, request.TextContent);
+                                        break;
+                                    case TransferType.ChatCloseRequest:
+                                        ChatCloseRequested?.Invoke();
+                                        break;
+                                    case TransferType.ChatCloseAccept:
+                                        ChatCloseResponded?.Invoke(true);
+                                        break;
+                                    case TransferType.ChatCloseReject:
+                                        ChatCloseResponded?.Invoke(false);
+                                        break;
+                                    case TransferType.RemoteControlStop:
+                                        RemoteControlStopReceived?.Invoke();
+                                        break;
+                                    case TransferType.ChatConfig when request.TextContent is not null:
+                                        {
+                                            var config = JsonSerializer.Deserialize(request.TextContent, AppJsonContext.Default.ChatConfig);
+                                            if (config is not null)
+                                                ChatConfigReceived?.Invoke(config);
+                                            break;
+                                        }
+                                    case TransferType.SharePreferences when request.TextContent is not null:
+                                        {
+                                            var preferences = JsonSerializer.Deserialize(request.TextContent, AppJsonContext.Default.SharePreferences);
+                                            if (preferences is not null)
+                                                SharePreferencesReceived?.Invoke(preferences);
+                                            break;
+                                        }
+                                    default:
+                                        break;
+                                }
+
+                                break;
+                            }
+                        case ChatFrameKind.InputEventBinary:
+                            {
+                                if (decrypted.Length < 14)
+                                    break;
+
+                                var inputEvent = new InputEvent
+                                {
+                                    Kind = (InputEventKind)decrypted[1],
+                                    Arg1 = BinaryPrimitives.ReadInt32LittleEndian(decrypted.Slice(2, 4)),
+                                    Arg2 = BinaryPrimitives.ReadInt32LittleEndian(decrypted.Slice(6, 4)),
+                                    Arg3 = BinaryPrimitives.ReadInt32LittleEndian(decrypted.Slice(10, 4))
+                                };
+
                                 InputEventReceived?.Invoke(inputEvent);
+                                break;
+                            }
+                        case ChatFrameKind.InputEventBatchBinary:
+                            {
+                                if (decrypted.Length < 2)
+                                    break;
+
+                                var count = decrypted[1];
+                                var expectedLength = 2 + (count * 13);
+                                if (count == 0 || decrypted.Length < expectedLength)
+                                    break;
+
+                                var offset = 2;
+                                for (var i = 0; i < count; i++)
+                                {
+                                    var inputEvent = new InputEvent
+                                    {
+                                        Kind = (InputEventKind)decrypted[offset],
+                                        Arg1 = BinaryPrimitives.ReadInt32LittleEndian(decrypted.Slice(offset + 1, 4)),
+                                        Arg2 = BinaryPrimitives.ReadInt32LittleEndian(decrypted.Slice(offset + 5, 4)),
+                                        Arg3 = BinaryPrimitives.ReadInt32LittleEndian(decrypted.Slice(offset + 9, 4))
+                                    };
+
+                                    InputEventReceived?.Invoke(inputEvent);
+                                    offset += 13;
+                                }
+
+                                break;
+                            }
+                        default:
+                            // 알 수 없는 프레임 타입은 무시
                             break;
-                        }
-                    case TransferType.ChatConfig when request.TextContent is not null:
-                        {
-                            var config = JsonSerializer.Deserialize(request.TextContent, AppJsonContext.Default.ChatConfig);
-                            if (config is not null)
-                                ChatConfigReceived?.Invoke(config);
-                            break;
-                        }
-                    case TransferType.SharePreferences when request.TextContent is not null:
-                        {
-                            var preferences = JsonSerializer.Deserialize(request.TextContent, AppJsonContext.Default.SharePreferences);
-                            if (preferences is not null)
-                                SharePreferencesReceived?.Invoke(preferences);
-                            break;
-                        }
-                    default:
-                        // 알 수 없는 타입은 무시
-                        break;
+                    }
+                }
+                finally
+                {
+                    BufferPool.Return(decryptedBuffer);
                 }
             }
         }
@@ -333,7 +470,7 @@ public sealed class ChatConnection : IDisposable
 
     // --- 저수준 프레임 읽기/쓰기 (4B 길이 프리픽스) ---
 
-    private async Task SendRawAsync(byte[] data, CancellationToken cancellationToken)
+    private async Task SendRawAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken)
     {
         var lengthBytes = BitConverter.GetBytes(IPAddress.HostToNetworkOrder(data.Length));
         await _stream.WriteAsync(lengthBytes, cancellationToken);
@@ -341,15 +478,17 @@ public sealed class ChatConnection : IDisposable
         await _stream.FlushAsync(cancellationToken);
     }
 
-    private async Task<byte[]> ReadRawAsync(CancellationToken cancellationToken)
+    private readonly record struct PooledBuffer(byte[] Buffer, int Length);
+
+    private async Task<PooledBuffer> ReadRawPooledAsync(CancellationToken cancellationToken)
     {
         var lengthBytes = new byte[4];
         await _stream.ReadExactlyAsync(lengthBytes, cancellationToken);
         var length = IPAddress.NetworkToHostOrder(BitConverter.ToInt32(lengthBytes));
 
-        var data = new byte[length];
-        await _stream.ReadExactlyAsync(data, cancellationToken);
-        return data;
+        var data = BufferPool.Rent(length);
+        await _stream.ReadExactlyAsync(data.AsMemory(0, length), cancellationToken);
+        return new PooledBuffer(data, length);
     }
 
     public void Dispose()

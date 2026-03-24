@@ -20,6 +20,7 @@ public partial class MainWindow : Window
     private readonly MainViewModel _viewModel;
     private System.Windows.Forms.NotifyIcon? _notifyIcon;
     private bool _isExiting;
+    private bool _autoMinimizedByRemoteMode;
 
     /// <summary>열려있는 채팅창 관리 (DeviceId → ChatWindow)</summary>
     private readonly Dictionary<string, ChatWindow> _chatWindows = [];
@@ -100,7 +101,13 @@ public partial class MainWindow : Window
             App.Current.Services.GetRequiredService<Services.ISettingsService>(),
             App.Current.Services.GetRequiredService<Services.IClipboardService>());
         var chatWindow = new ChatWindow(chatVm);
-        chatWindow.Closed += (_, _) => _chatWindows.Remove(device.DeviceId);
+        chatWindow.RemoteUiInterferenceChanged += OnChatRemoteUiInterferenceChanged;
+        chatWindow.Closed += (_, _) =>
+        {
+            chatWindow.RemoteUiInterferenceChanged -= OnChatRemoteUiInterferenceChanged;
+            _chatWindows.Remove(device.DeviceId);
+            UpdateMainWindowInteractivityFromChats();
+        };
         _chatWindows[device.DeviceId] = chatWindow;
         chatWindow.Show();
 
@@ -165,7 +172,13 @@ public partial class MainWindow : Window
                 App.Current.Services.GetRequiredService<Services.ISettingsService>(),
                 App.Current.Services.GetRequiredService<Services.IClipboardService>());
             chatWindow = new ChatWindow(chatVm);
-            chatWindow.Closed += (_, _) => _chatWindows.Remove(device.DeviceId);
+            chatWindow.RemoteUiInterferenceChanged += OnChatRemoteUiInterferenceChanged;
+            chatWindow.Closed += (_, _) =>
+            {
+                chatWindow.RemoteUiInterferenceChanged -= OnChatRemoteUiInterferenceChanged;
+                _chatWindows.Remove(device.DeviceId);
+                UpdateMainWindowInteractivityFromChats();
+            };
             _chatWindows[device.DeviceId] = chatWindow;
             chatWindow.Show();
         }
@@ -205,6 +218,33 @@ public partial class MainWindow : Window
         if (DeviceList.SelectedItem is DeviceInfo device)
         {
             OpenChatWindow(device);
+        }
+    }
+
+    private void OnChatRemoteUiInterferenceChanged(bool _)
+        => Dispatcher.Invoke(UpdateMainWindowInteractivityFromChats);
+
+    private void UpdateMainWindowInteractivityFromChats()
+    {
+        var shouldReduceUiInterference = _chatWindows.Values.Any(window => window.IsRemoteUiInterferenceActive);
+
+        if (shouldReduceUiInterference)
+        {
+            if (WindowState is not WindowState.Minimized)
+            {
+                _autoMinimizedByRemoteMode = true;
+                WindowState = WindowState.Minimized;
+            }
+
+            return;
+        }
+
+        if (_autoMinimizedByRemoteMode && WindowState is WindowState.Minimized)
+        {
+            _autoMinimizedByRemoteMode = false;
+            Show();
+            ShowInTaskbar = true;
+            WindowState = WindowState.Normal;
         }
     }
 

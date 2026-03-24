@@ -19,7 +19,12 @@ public partial class ChatWindow : Window
     private bool _forceClose;
     private bool _closingInProgress;
     private bool _isBeingRemoteControlled;
+    private bool _isRemoteInputMode;
+    private bool _autoMinimizedByRemoteMode;
     private RemoteCursorOverlayWindow? _remoteCursorOverlay;
+
+    public bool IsRemoteUiInterferenceActive { get; private set; }
+    public event Action<bool>? RemoteUiInterferenceChanged;
 
     public ChatWindow(ChatViewModel viewModel)
     {
@@ -29,11 +34,13 @@ public partial class ChatWindow : Window
 
         ViewModel.RemoteCloseRequested += OnRemoteCloseRequested;
         ViewModel.RemoteControlStateChanged += OnRemoteControlStateChanged;
+        ViewModel.RemoteInputModeChanged += OnRemoteInputModeChanged;
         ViewModel.RemoteCursorActivity += OnRemoteCursorActivity;
         Closed += (_, _) =>
         {
             ViewModel.RemoteCloseRequested -= OnRemoteCloseRequested;
             ViewModel.RemoteControlStateChanged -= OnRemoteControlStateChanged;
+            ViewModel.RemoteInputModeChanged -= OnRemoteInputModeChanged;
             ViewModel.RemoteCursorActivity -= OnRemoteCursorActivity;
 
             _ = ViewModel.CleanupOnWindowClosedAsync();
@@ -77,6 +84,7 @@ public partial class ChatWindow : Window
         _ = Dispatcher.InvokeAsync(() =>
         {
             _isBeingRemoteControlled = active;
+            UpdateRemoteWindowInteractivity();
             if (active)
             {
                 _remoteCursorOverlay ??= new RemoteCursorOverlayWindow();
@@ -90,6 +98,43 @@ public partial class ChatWindow : Window
                     _remoteCursorOverlay.Hide();
             }
         });
+    }
+
+    private void OnRemoteInputModeChanged(bool active)
+    {
+        _ = Dispatcher.InvokeAsync(() =>
+        {
+            _isRemoteInputMode = active;
+            UpdateRemoteWindowInteractivity();
+        });
+    }
+
+    private void UpdateRemoteWindowInteractivity()
+    {
+        var shouldReduceUiInterference = _isBeingRemoteControlled || _isRemoteInputMode;
+
+        if (IsRemoteUiInterferenceActive != shouldReduceUiInterference)
+        {
+            IsRemoteUiInterferenceActive = shouldReduceUiInterference;
+            RemoteUiInterferenceChanged?.Invoke(shouldReduceUiInterference);
+        }
+
+        if (shouldReduceUiInterference)
+        {
+            if (WindowState is not WindowState.Minimized)
+            {
+                _autoMinimizedByRemoteMode = true;
+                WindowState = WindowState.Minimized;
+            }
+
+            return;
+        }
+
+        if (_autoMinimizedByRemoteMode && WindowState is WindowState.Minimized)
+        {
+            _autoMinimizedByRemoteMode = false;
+            WindowState = WindowState.Normal;
+        }
     }
 
     private void OnRemoteCursorActivity()

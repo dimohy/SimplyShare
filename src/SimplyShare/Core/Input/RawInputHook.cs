@@ -1,18 +1,21 @@
 using System.Runtime.InteropServices;
-using System.Windows.Interop;
 
 namespace SimplyShare.Core.Input;
 
 public sealed class RawInputHook : IDisposable
 {
     private const int WM_INPUT = 0x00FF;
+    private const int WM_DESTROY = 0x0002;
 
-    private HwndSource? _source;
     private nint _hwnd;
+    private Thread? _messageThread;
     private bool _started;
     private bool _hasAbsoluteBaseline;
     private int _lastAbsoluteX;
     private int _lastAbsoluteY;
+    private nint _rawInputBuffer;
+    private int _rawInputBufferSize;
+    private WndProcDelegate? _wndProcDelegate;
 
     public event Action<int, int>? MouseDelta;
     public event Action<int>? MouseWheel;
@@ -26,21 +29,19 @@ public sealed class RawInputHook : IDisposable
         if (_started)
             return;
 
-        var parameters = new HwndSourceParameters("SimplyShareRawInput")
-        {
-            Width = 0,
-            Height = 0,
-            PositionX = -200,
-            PositionY = -200,
-            WindowStyle = 0
-        };
-
-        _source = new HwndSource(parameters);
-        _hwnd = _source.Handle;
-        _source.AddHook(WndProc);
-
-        RegisterDevices(_hwnd);
         _started = true;
+
+        var ready = new ManualResetEventSlim(false);
+
+        _messageThread = new Thread(() => MessageThreadProc(ready))
+        {
+            IsBackground = true,
+            Name = "RawInputHook"
+        };
+        _messageThread.SetApartmentState(ApartmentState.STA);
+        _messageThread.Start();
+
+        ready.Wait();
     }
 
     public void Stop()
@@ -48,23 +49,70 @@ public sealed class RawInputHook : IDisposable
         if (!_started)
             return;
 
-        if (_source is not null)
+        _started = false;
+
+        if (_hwnd != 0)
         {
-            _source.RemoveHook(WndProc);
-            _source.Dispose();
-            _source = null;
+            PostMessage(_hwnd, WM_DESTROY, 0, 0);
         }
 
+        _messageThread?.Join(2000);
+        _messageThread = null;
         _hwnd = 0;
-        _started = false;
         _hasAbsoluteBaseline = false;
+        ReleaseRawInputBuffer();
     }
 
-    private nint WndProc(nint hwnd, int msg, nint wParam, nint lParam, ref bool handled)
+    private void MessageThreadProc(ManualResetEventSlim ready)
+    {
+        _wndProcDelegate = WndProc;
+
+        var wndClass = new WNDCLASSEX
+        {
+            cbSize = Marshal.SizeOf<WNDCLASSEX>(),
+            lpfnWndProc = _wndProcDelegate,
+            hInstance = GetModuleHandle(null),
+            lpszClassName = "SimplyShareRawInput_" + Environment.TickCount64
+        };
+
+        var atom = RegisterClassEx(ref wndClass);
+        if (atom == 0)
+        {
+            AppLogger.Log("RawInput", $"RegisterClassEx 실패: {Marshal.GetLastWin32Error()}");
+            ready.Set();
+            return;
+        }
+
+        _hwnd = CreateWindowEx(
+            0, wndClass.lpszClassName, string.Empty, 0,
+            -200, -200, 0, 0,
+            HWND_MESSAGE, 0, wndClass.hInstance, 0);
+
+        if (_hwnd == 0)
+        {
+            AppLogger.Log("RawInput", $"CreateWindowEx 실패: {Marshal.GetLastWin32Error()}");
+            ready.Set();
+            return;
+        }
+
+        RegisterDevices(_hwnd);
+        ready.Set();
+
+        while (GetMessage(out var msg, 0, 0, 0) > 0)
+        {
+            TranslateMessage(ref msg);
+            DispatchMessage(ref msg);
+        }
+
+        DestroyWindow(_hwnd);
+        UnregisterClass(wndClass.lpszClassName, wndClass.hInstance);
+        _hwnd = 0;
+    }
+
+    private nint WndProc(nint hwnd, uint msg, nint wParam, nint lParam)
     {
         if (msg == WM_INPUT)
         {
-            handled = true;
             try
             {
                 ProcessRawInput(lParam);
@@ -73,9 +121,17 @@ public sealed class RawInputHook : IDisposable
             {
                 // 메시지 루프에서 예외 전파 금지
             }
+
+            return 0;
         }
 
-        return 0;
+        if (msg == WM_DESTROY)
+        {
+            PostQuitMessage(0);
+            return 0;
+        }
+
+        return DefWindowProc(hwnd, msg, wParam, lParam);
     }
 
     private void ProcessRawInput(nint hRawInput)
@@ -85,28 +141,43 @@ public sealed class RawInputHook : IDisposable
         if (dwSize == 0)
             return;
 
-        var buffer = Marshal.AllocHGlobal((int)dwSize);
-        try
-        {
-            var read = GetRawInputData(hRawInput, RID_INPUT, buffer, ref dwSize, (uint)Marshal.SizeOf<RAWINPUTHEADER>());
-            if (read == 0 || read != dwSize)
-                return;
+        EnsureRawInputBufferCapacity((int)dwSize);
 
-            var raw = Marshal.PtrToStructure<RAWINPUT>(buffer);
-            switch (raw.header.dwType)
-            {
-                case RIM_TYPEMOUSE:
-                    HandleMouse(raw.data.mouse);
-                    break;
-                case RIM_TYPEKEYBOARD:
-                    HandleKeyboard(raw.data.keyboard);
-                    break;
-            }
-        }
-        finally
+        var read = GetRawInputData(hRawInput, RID_INPUT, _rawInputBuffer, ref dwSize, (uint)Marshal.SizeOf<RAWINPUTHEADER>());
+        if (read == 0 || read != dwSize)
+            return;
+
+        var raw = Marshal.PtrToStructure<RAWINPUT>(_rawInputBuffer);
+        switch (raw.header.dwType)
         {
-            Marshal.FreeHGlobal(buffer);
+            case RIM_TYPEMOUSE:
+                HandleMouse(raw.data.mouse);
+                break;
+            case RIM_TYPEKEYBOARD:
+                HandleKeyboard(raw.data.keyboard);
+                break;
         }
+    }
+
+    private void EnsureRawInputBufferCapacity(int requiredSize)
+    {
+        if (requiredSize <= _rawInputBufferSize && _rawInputBuffer != nint.Zero)
+            return;
+
+        _rawInputBuffer = _rawInputBuffer == nint.Zero
+            ? Marshal.AllocHGlobal(requiredSize)
+            : Marshal.ReAllocHGlobal(_rawInputBuffer, (nint)requiredSize);
+        _rawInputBufferSize = requiredSize;
+    }
+
+    private void ReleaseRawInputBuffer()
+    {
+        if (_rawInputBuffer == nint.Zero)
+            return;
+
+        Marshal.FreeHGlobal(_rawInputBuffer);
+        _rawInputBuffer = nint.Zero;
+        _rawInputBufferSize = 0;
     }
 
     private void HandleMouse(RAWMOUSE mouse)
@@ -117,8 +188,8 @@ public sealed class RawInputHook : IDisposable
         if ((mouse.usFlags & MOUSE_MOVE_ABSOLUTE) != 0)
         {
             var bounds = (mouse.usFlags & MOUSE_VIRTUAL_DESKTOP) != 0
-                ? System.Windows.Forms.SystemInformation.VirtualScreen
-                : System.Windows.Forms.Screen.PrimaryScreen?.Bounds ?? new System.Drawing.Rectangle(0, 0, 1920, 1080);
+                ? ScreenInfo.VirtualScreen
+                : ScreenInfo.PrimaryMonitorBounds;
 
             var absX = bounds.Left + (int)Math.Round(mouse.lLastX * (bounds.Width / 65535.0));
             var absY = bounds.Top + (int)Math.Round(mouse.lLastY * (bounds.Height / 65535.0));
@@ -291,4 +362,76 @@ public sealed class RawInputHook : IDisposable
         nint pData,
         ref uint pcbSize,
         uint cbSizeHeader);
+
+    // ── 윈도우 생성/메시지 루프 ──
+
+    private static readonly nint HWND_MESSAGE = new(-3);
+
+    private delegate nint WndProcDelegate(nint hwnd, uint msg, nint wParam, nint lParam);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct WNDCLASSEX
+    {
+        public int cbSize;
+        public int style;
+        [MarshalAs(UnmanagedType.FunctionPtr)]
+        public WndProcDelegate lpfnWndProc;
+        public int cbClsExtra;
+        public int cbWndExtra;
+        public nint hInstance;
+        public nint hIcon;
+        public nint hCursor;
+        public nint hbrBackground;
+        public string lpszMenuName;
+        public string lpszClassName;
+        public nint hIconSm;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MSG
+    {
+        public nint hwnd;
+        public uint message;
+        public nint wParam;
+        public nint lParam;
+        public uint time;
+        public int pt_x;
+        public int pt_y;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    private static extern nint GetModuleHandle(string? lpModuleName);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern ushort RegisterClassEx(ref WNDCLASSEX lpwcx);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool UnregisterClass(string lpClassName, nint hInstance);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern nint CreateWindowEx(
+        int dwExStyle, string lpClassName, string lpWindowName, int dwStyle,
+        int x, int y, int nWidth, int nHeight,
+        nint hWndParent, nint hMenu, nint hInstance, nint lpParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool DestroyWindow(nint hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern nint DefWindowProc(nint hWnd, uint msg, nint wParam, nint lParam);
+
+    [DllImport("user32.dll")]
+    private static extern int GetMessage(out MSG lpMsg, nint hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
+
+    [DllImport("user32.dll")]
+    private static extern bool TranslateMessage(ref MSG lpMsg);
+
+    [DllImport("user32.dll")]
+    private static extern nint DispatchMessage(ref MSG lpMsg);
+
+    [DllImport("user32.dll")]
+    private static extern bool PostMessage(nint hWnd, uint msg, nint wParam, nint lParam);
+
+    [DllImport("user32.dll")]
+    private static extern void PostQuitMessage(int nExitCode);
 }
