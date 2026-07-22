@@ -6,35 +6,17 @@ internal static class SimplyShareTheme
 {
     private static readonly string FontsDirectory = Environment.GetFolderPath(Environment.SpecialFolder.Fonts);
 
-    public static UiTheme Light => UiTheme.ImGuiLight with
-    {
-        WindowBg = new UiColor(255, 255, 255),
-        PopupBg = new UiColor(248, 248, 248),
-        Border = new UiColor(224, 224, 224),
-        FrameBg = new UiColor(250, 250, 250),
-        FrameBgHovered = new UiColor(242, 242, 242),
-        FrameBgActive = new UiColor(235, 235, 235),
-        Header = new UiColor(255, 255, 255),
-        HeaderHovered = new UiColor(246, 248, 251),
-        HeaderActive = new UiColor(236, 240, 245),
-        Button = new UiColor(248, 248, 248),
-        ButtonHovered = new UiColor(240, 240, 240),
-        ButtonActive = new UiColor(232, 232, 232),
-        Separator = new UiColor(224, 224, 224),
-        ScrollbarBg = new UiColor(0, 0, 0, 28),
-        ScrollbarGrab = new UiColor(180, 180, 180),
-        ScrollbarGrabHovered = new UiColor(160, 160, 160),
-        ScrollbarGrabActive = new UiColor(140, 140, 140),
-    };
-
-    public static UiColor TextPrimary => new(0, 0, 0);
-    public static UiColor TextSecondary => new(128, 128, 128);
-    public static UiColor Border => new(224, 224, 224);
-    public static UiColor BubbleSent => new(220, 248, 198);
-    public static UiColor BubbleReceived => new(240, 240, 240);
+    public static UiColor WindowBackground(UiImmediateContext ui) => ui.GetColorU32(UiStyleColor.WindowBg);
+    public static UiColor Surface(UiImmediateContext ui) => ui.GetColorU32(UiStyleColor.Header);
+    public static UiColor TextPrimary(UiImmediateContext ui) => ui.GetColorU32(UiStyleColor.Text);
+    public static UiColor TextSecondary(UiImmediateContext ui) => ui.GetColorU32(UiStyleColor.TextDisabled);
+    public static UiColor Border(UiImmediateContext ui) => ui.GetColorU32(UiStyleColor.Separator);
+    public static UiColor Selection(UiImmediateContext ui) => ui.GetColorU32(UiStyleColor.HeaderActive);
+    public static UiColor SelectionHovered(UiImmediateContext ui) => ui.GetColorU32(UiStyleColor.HeaderHovered);
+    public static UiColor BubbleSent(UiImmediateContext ui) => ui.GetColorU32(UiStyleColor.HeaderActive);
+    public static UiColor BubbleReceived(UiImmediateContext ui) => ui.GetColorU32(UiStyleColor.FrameBg);
     public static UiColor StatusOnline => new(33, 180, 78);
     public static UiColor StatusOffline => new(171, 171, 171);
-    public static UiColor Accent => new(0, 122, 204);
 
     public static string TitlePrimaryFontPath => ResolveFontPath("segoeuib.ttf", "seguisb.ttf", "segoeui.ttf");
     public static string TitleSecondaryFontPath => ResolveFontPath("malgunbd.ttf", "malgun.ttf");

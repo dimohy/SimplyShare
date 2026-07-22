@@ -20,12 +20,18 @@ internal sealed class SimplyShareController
     private readonly Dictionary<string, ChatSessionState> _chatSessions = [];
     private readonly Dictionary<string, ChatWindowState> _chatWindowStates = [];
     private readonly Dictionary<string, DuxelModelessWindow> _chatWindows = [];
+    private readonly HashSet<string> _remoteUiInterferenceDeviceIds = [];
+    private readonly HashSet<string> _autoMinimizedChatDeviceIds = [];
     private readonly List<DeviceInfo> _devices = [];
-    private readonly List<PendingTransferPrompt> _pendingTransferPrompts = [];
+    private readonly SemaphoreSlim _transferPromptLock = new(1, 1);
+    private readonly object _remoteCursorOverlaySync = new();
+    private NativeRemoteCursorOverlay? _remoteCursorOverlay;
     private nint _mainWindowHandle;
     private int _isInitialized;
     private int _isUpdating;
     private int _isSettingsWindowOpen;
+    private int _runtimeStarted;
+    private bool _autoMinimizedMainWindow;
 
     public SimplyShareController(
         ISettingsService settingsService,
@@ -53,7 +59,6 @@ internal sealed class SimplyShareController
     public byte[] IconData { get; set; } = [];
     public bool IsSetupRequired => !Settings.IsSetupCompleted;
     public IReadOnlyList<DeviceInfo> Devices => _devices;
-    public PendingTransferPrompt? ActiveTransferPrompt => _pendingTransferPrompts.Count is 0 ? null : _pendingTransferPrompts[0];
 
     public ChatSessionState? SelectedSession
         => SelectedDeviceId is not null && _chatSessions.TryGetValue(SelectedDeviceId, out var session)
@@ -81,11 +86,10 @@ internal sealed class SimplyShareController
         _transferService.ChatEstablished += HandleChatEstablished;
         _clipboardService.ClipboardTextChanged += HandleClipboardTextChanged;
 
-        Directory.CreateDirectory(Settings.DownloadPath);
-        await _discoveryService.StartAsync(cancellationToken);
-        await _transferService.StartServerAsync(cancellationToken);
-        _clipboardService.Start();
-        ClipboardText = _clipboardService.CurrentText;
+        if (!IsSetupRequired)
+        {
+            await StartRuntimeServicesAsync(cancellationToken);
+        }
 
         var lastUpdateStatus = AutoUpdater.ConsumeLastUpdateStatus();
         if (!string.IsNullOrWhiteSpace(lastUpdateStatus))
@@ -117,7 +121,10 @@ internal sealed class SimplyShareController
         _transferService.ChatEstablished -= HandleChatEstablished;
         _clipboardService.ClipboardTextChanged -= HandleClipboardTextChanged;
 
-        _clipboardService.Stop();
+        if (Interlocked.Exchange(ref _runtimeStarted, 0) != 0)
+        {
+            _clipboardService.Stop();
+        }
 
         foreach (var chatWindow in _chatWindows.Values)
         {
@@ -131,9 +138,99 @@ internal sealed class SimplyShareController
 
         _chatWindows.Clear();
         _chatWindowStates.Clear();
+        lock (_remoteCursorOverlaySync)
+        {
+            _remoteCursorOverlay?.Dispose();
+            _remoteCursorOverlay = null;
+        }
+        if (!IsSetupRequired)
+        {
+            await _transferService.StopServerAsync(cancellationToken);
+            await _discoveryService.StopAsync(cancellationToken);
+        }
+    }
 
-        await _transferService.StopServerAsync(cancellationToken);
-        await _discoveryService.StopAsync(cancellationToken);
+    public async Task<bool> ShowInitialSetupAsync()
+    {
+        if (!IsSetupRequired)
+        {
+            return true;
+        }
+
+        var completed = false;
+        await DuxelWindowsApp.ShowModalAsync(closeRequested => new DuxelAppOptions
+        {
+            Window = new DuxelWindowOptions
+            {
+                Title = "SimplyShare - 초기 설정",
+                Width = 400,
+                Height = 350,
+                MinWidth = 400,
+                MinHeight = 350,
+                Resizable = false,
+                ShowMinimizeButton = false,
+                ShowMaximizeButton = false,
+                CenterOnScreen = true,
+                IconData = IconData,
+            },
+            Renderer = new DuxelRendererOptions
+            {
+                Profile = DuxelPerformanceProfile.Display,
+                MsaaSamples = 0,
+                FontLinearSampling = false,
+            },
+            Font = new DuxelFontOptions
+            {
+                FontSize = 14,
+                FastStartup = false,
+                StartupGlyphs = SimplyShareGlyphCatalog.All,
+            },
+            Screen = new SimplyShareSetupScreen(SetupDraft, () =>
+            {
+                var error = TryCompleteInitialSetup();
+                completed = error is null;
+                return error;
+            }, closeRequested),
+        });
+
+        return completed;
+    }
+
+    private string? TryCompleteInitialSetup()
+    {
+        try
+        {
+            LastError = null;
+            CompleteSetupAsync().GetAwaiter().GetResult();
+            return LastError ?? (IsSetupRequired ? StatusMessage : null);
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Log(nameof(SimplyShareController), $"초기 설정 실패: {ex}");
+            return $"초기 설정 실패: {ex.Message}";
+        }
+    }
+
+    private async Task StartRuntimeServicesAsync(CancellationToken cancellationToken = default)
+    {
+        if (Interlocked.CompareExchange(ref _runtimeStarted, 1, 0) != 0)
+        {
+            return;
+        }
+
+        try
+        {
+            Directory.CreateDirectory(Settings.DownloadPath);
+            await _discoveryService.StartAsync(cancellationToken);
+            await _transferService.StartServerAsync(cancellationToken);
+            _clipboardService.Start();
+            ClipboardText = _clipboardService.CurrentText;
+        }
+        catch
+        {
+            Interlocked.Exchange(ref _runtimeStarted, 0);
+            throw;
+        }
     }
 
     public void DrainUiActions()
@@ -151,7 +248,6 @@ internal sealed class SimplyShareController
         if (_devices.FirstOrDefault(device => device.DeviceId == deviceId) is { } device)
         {
             _ = GetOrCreateSession(device);
-            StatusMessage = $"{device.Nickname} 장치를 선택했습니다.";
         }
     }
 
@@ -195,14 +291,13 @@ internal sealed class SimplyShareController
 
             await DuxelWindowsApp.ShowModalAsync(closeRequested => new DuxelAppOptions
             {
-                Theme = SimplyShareTheme.Light,
                 Window = new DuxelWindowOptions
                 {
                     Title = "SimplyShare - 설정",
-                    Width = 390,
-                    Height = 510,
-                    MinWidth = 390,
-                    MinHeight = 510,
+                    Width = 420,
+                    Height = 450,
+                    MinWidth = 420,
+                    MinHeight = 450,
                     Resizable = false,
                     ShowMinimizeButton = false,
                     ShowMaximizeButton = false,
@@ -228,7 +323,7 @@ internal sealed class SimplyShareController
                     EnableIdleFrameSkip = true,
                     LineHeightScale = 1.1f,
                 },
-                Screen = new SimplyShareSettingsScreen(dialogDraft, TrySaveSettingsDialog, closeRequested),
+                Screen = new SimplyShareSettingsScreen(dialogDraft, TrySaveSettingsDialog),
             }, ownerWindowHandle);
         }
         catch (Exception ex)
@@ -261,10 +356,11 @@ internal sealed class SimplyShareController
 
         var sessionState = GetOrCreateSession(device);
         ChatWindowState? chatWindowState = null;
+        NativeWindowHook? windowHook = null;
+        nint chatWindowHandle = nint.Zero;
 
         var chatWindow = DuxelWindowsApp.ShowModeless(session => new DuxelAppOptions
         {
-            Theme = SimplyShareTheme.Light,
             Window = new DuxelWindowOptions
             {
                 Title = $"{device.Nickname} ({device.IpAddress})",
@@ -277,6 +373,14 @@ internal sealed class SimplyShareController
                 ShowMaximizeButton = false,
                 CenterOnScreen = true,
                 IconData = IconData,
+                WindowCreated = windowHandle =>
+                {
+                    chatWindowHandle = windowHandle;
+                    windowHook = new NativeWindowHook(
+                        windowHandle,
+                        paths => chatWindowState?.BeginSendFiles(paths),
+                        closeRequested: () => chatWindowState?.BeginCloseFromWindow(windowHook));
+                },
             },
             Renderer = new DuxelRendererOptions
             {
@@ -295,22 +399,31 @@ internal sealed class SimplyShareController
                 EnableIdleFrameSkip = true,
                 LineHeightScale = 1.2f,
             },
-            Screen = new SimplyShareChatScreen(chatWindowState = new ChatWindowState(
-                device,
-                _transferService,
-                _settingsService,
-                _clipboardService,
-                session.RequestFrame,
-                session.Exit,
-                sessionState.Messages)),
+            Screen = new SimplyShareChatScreen(
+                chatWindowState = new ChatWindowState(
+                    device,
+                    _transferService,
+                    _settingsService,
+                    _clipboardService,
+                    session.RequestFrame,
+                    session.Exit,
+                    active => QueueRemoteUiInterferenceChange(deviceId, active),
+                    UpdateRemoteCursorOverlayState,
+                    UpdateRemoteCursorOverlayPosition,
+                    sessionState.Messages),
+                text => OpenTextViewerWindow(text, chatWindowHandle)),
         }, () =>
         {
+            windowHook?.Dispose();
             if (_chatWindowStates.Remove(deviceId, out var state))
             {
                 state.Dispose();
             }
 
             _chatWindows.Remove(deviceId);
+            _remoteUiInterferenceDeviceIds.Remove(deviceId);
+            _autoMinimizedChatDeviceIds.Remove(deviceId);
+            UpdateMainWindowRemoteInterference();
             DuxelApp.RequestFrame();
         });
 
@@ -321,6 +434,84 @@ internal sealed class SimplyShareController
 
         _chatWindows[deviceId] = chatWindow;
         StatusMessage = $"{device.Nickname} 채팅 창을 열었습니다.";
+    }
+
+    private void UpdateRemoteCursorOverlayState(bool active)
+    {
+        lock (_remoteCursorOverlaySync)
+        {
+            if (active)
+            {
+                _remoteCursorOverlay ??= new NativeRemoteCursorOverlay();
+                _remoteCursorOverlay.Show();
+            }
+            else
+            {
+                _remoteCursorOverlay?.Hide();
+            }
+        }
+    }
+
+    private void UpdateRemoteCursorOverlayPosition()
+    {
+        lock (_remoteCursorOverlaySync)
+        {
+            _remoteCursorOverlay?.UpdatePosition();
+        }
+    }
+
+    private void QueueRemoteUiInterferenceChange(string deviceId, bool active)
+    {
+        _uiActions.Enqueue(() => UpdateRemoteUiInterference(deviceId, active));
+        DuxelApp.RequestFrame();
+    }
+
+    private void UpdateRemoteUiInterference(string deviceId, bool active)
+    {
+        if (active)
+        {
+            _remoteUiInterferenceDeviceIds.Add(deviceId);
+
+            if (_chatWindows.TryGetValue(deviceId, out var chatWindow) &&
+                NativeWindowHook.MinimizeIfNeeded(chatWindow.WindowHandle))
+            {
+                _autoMinimizedChatDeviceIds.Add(deviceId);
+            }
+        }
+        else
+        {
+            _remoteUiInterferenceDeviceIds.Remove(deviceId);
+
+            if (_autoMinimizedChatDeviceIds.Remove(deviceId) &&
+                _chatWindows.TryGetValue(deviceId, out var chatWindow) &&
+                NativeWindowHook.IsMinimized(chatWindow.WindowHandle))
+            {
+                chatWindow.Restore();
+            }
+        }
+
+        UpdateMainWindowRemoteInterference();
+    }
+
+    private void UpdateMainWindowRemoteInterference()
+    {
+        var mainWindowHandle = Interlocked.CompareExchange(ref _mainWindowHandle, nint.Zero, nint.Zero);
+
+        if (_remoteUiInterferenceDeviceIds.Count > 0)
+        {
+            if (NativeWindowHook.MinimizeIfNeeded(mainWindowHandle))
+            {
+                _autoMinimizedMainWindow = true;
+            }
+
+            return;
+        }
+
+        if (_autoMinimizedMainWindow && NativeWindowHook.IsMinimized(mainWindowHandle))
+        {
+            _autoMinimizedMainWindow = false;
+            DuxelWindowsApp.RestoreWindow(mainWindowHandle);
+        }
     }
 
     public void BeginSaveSettings()
@@ -397,7 +588,18 @@ internal sealed class SimplyShareController
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
 
-        if (paths.Length is 0)
+        BeginSendSelectedFiles(paths);
+    }
+
+    public void BeginSendSelectedFiles(IReadOnlyList<string> paths)
+    {
+        if (SelectedSession is null)
+        {
+            StatusMessage = "선택된 장치가 없습니다.";
+            return;
+        }
+
+        if (paths.Count is 0)
         {
             StatusMessage = "보낼 파일 경로를 줄바꿈으로 입력하세요.";
             return;
@@ -413,46 +615,15 @@ internal sealed class SimplyShareController
         {
             Type = ChatMessageType.System,
             Direction = ChatDirection.Sent,
-            Text = $"파일 전송 요청: {paths.Length}개",
+            Text = $"파일 전송 요청: {paths.Count}개",
             Status = ChatMessageStatus.Sending,
             Progress = 0,
         };
 
-        session.Messages.Add(message);
-        session.DraftPaths = string.Empty;
+        SelectedSession.Messages.Add(message);
+        SelectedSession.DraftPaths = string.Empty;
         StatusMessage = $"{device.Nickname}에게 파일 전송 중...";
         _ = SendFilesCoreAsync(device, paths, message);
-    }
-
-    public void AcceptActiveTransfer()
-    {
-        if (ActiveTransferPrompt is not { } prompt)
-        {
-            return;
-        }
-
-        _pendingTransferPrompts.RemoveAt(0);
-
-        if (!Settings.PairedDeviceIds.Contains(prompt.Request.SenderDeviceId, StringComparer.Ordinal))
-        {
-            Settings.PairedDeviceIds.Add(prompt.Request.SenderDeviceId);
-            _ = _settingsService.SaveAsync();
-        }
-
-        prompt.Resolve(true);
-        StatusMessage = $"{prompt.Request.SenderNickname}의 전송 요청을 수락했습니다.";
-    }
-
-    public void RejectActiveTransfer()
-    {
-        if (ActiveTransferPrompt is not { } prompt)
-        {
-            return;
-        }
-
-        _pendingTransferPrompts.RemoveAt(0);
-        prompt.Resolve(false);
-        StatusMessage = $"{prompt.Request.SenderNickname}의 전송 요청을 거부했습니다.";
     }
 
     private async Task SaveSettingsAsync(CancellationToken cancellationToken = default)
@@ -479,19 +650,25 @@ internal sealed class SimplyShareController
 
         try
         {
+            var networkRanges = SetupDraft.NetworkRangesText
+                .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            if (networkRanges.FirstOrDefault(static range => !NetworkRangeFilter.IsValidPattern(range)) is { } invalidRange)
+            {
+                throw new InvalidOperationException($"올바르지 않은 네트워크 대역입니다: {invalidRange}");
+            }
+
             Settings.Nickname = SetupDraft.Nickname.Trim();
-            Settings.DownloadPath = NormalizePath(SetupDraft.DownloadPath);
-            Settings.NetworkRanges =
-            [
-                .. SetupDraft.NetworkRangesText
-                    .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            ];
+            if (networkRanges.Length > 0)
+            {
+                Settings.NetworkRanges = [.. networkRanges];
+            }
             Settings.IsSetupCompleted = true;
 
             Directory.CreateDirectory(Settings.DownloadPath);
             await _settingsService.SaveAsync(cancellationToken);
             LoadDraftsFromSettings();
             RefreshLocalIpAddress();
+            await StartRuntimeServicesAsync(cancellationToken);
             StatusMessage = "초기 설정 완료. 같은 네트워크의 장치를 검색 중...";
         }
         catch (Exception ex)
@@ -575,18 +752,18 @@ internal sealed class SimplyShareController
         => EnqueueUi(() =>
         {
             _devices.Clear();
-            _devices.AddRange(devices.OrderByDescending(static device => device.IsOnline).ThenBy(static device => device.Nickname, StringComparer.OrdinalIgnoreCase));
+            _devices.AddRange(devices);
 
             if (_devices.Count is 0)
             {
                 SelectedDeviceId = null;
-                StatusMessage = "같은 네트워크의 장치를 찾지 못했습니다.";
+                StatusMessage = "같은 네트워크의 장치를 검색 중...";
             }
             else
             {
-                if (SelectedDeviceId is null || !_devices.Any(device => device.DeviceId == SelectedDeviceId))
+                if (SelectedDeviceId is not null && !_devices.Any(device => device.DeviceId == SelectedDeviceId))
                 {
-                    SelectDevice(_devices[0].DeviceId);
+                    SelectedDeviceId = null;
                 }
 
                 StatusMessage = $"온라인 장치 {_devices.Count}대";
@@ -610,6 +787,10 @@ internal sealed class SimplyShareController
                 {
                     LastError = null;
                     StatusMessage = $"새 버전({device.Version}) 감지: {device.Nickname}에서 업데이트 다운로드 시작";
+                    NativeTrayNotification.Show(
+                        Interlocked.CompareExchange(ref _mainWindowHandle, nint.Zero, nint.Zero),
+                        "SimplyShare 업데이트",
+                        StatusMessage);
                 });
 
                 var newExePath = await _transferService.RequestUpdateAsync(device);
@@ -619,7 +800,14 @@ internal sealed class SimplyShareController
                     return;
                 }
 
-                EnqueueUi(() => StatusMessage = "업데이트 다운로드 완료: 재시작 준비 중..." );
+                EnqueueUi(() =>
+                {
+                    StatusMessage = "업데이트 다운로드 완료: 재시작 준비 중...";
+                    NativeTrayNotification.Show(
+                        Interlocked.CompareExchange(ref _mainWindowHandle, nint.Zero, nint.Zero),
+                        "SimplyShare 업데이트",
+                        StatusMessage);
+                });
                 await Task.Delay(1000).ConfigureAwait(false);
 
                 if (!AutoUpdater.ApplyUpdate(newExePath))
@@ -656,22 +844,69 @@ internal sealed class SimplyShareController
         });
     }
 
-    private Task<bool> HandleTransferRequestedAsync(TransferRequest request)
+    private async Task<bool> HandleTransferRequestedAsync(TransferRequest request)
     {
         if (Settings.PairedDeviceIds.Contains(request.SenderDeviceId, StringComparer.Ordinal))
         {
-            return Task.FromResult(true);
+            return true;
         }
 
-        var completionSource = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        EnqueueUi(() =>
+        await _transferPromptLock.WaitAsync();
+        try
         {
-            _pendingTransferPrompts.Add(new PendingTransferPrompt(request, completionSource));
-            StatusMessage = $"{request.SenderNickname} 장치의 전송 요청 도착";
-        });
+            RestoreMainWindow();
+            var ownerWindowHandle = Interlocked.CompareExchange(ref _mainWindowHandle, nint.Zero, nint.Zero);
+            NativeTrayNotification.Show(
+                ownerWindowHandle,
+                $"{request.SenderNickname}님의 파일 전송 요청",
+                $"파일 {request.Files.Count}개 ({FormatFileSize(request.TotalSize)})");
+            var accepted = false;
+            await DuxelWindowsApp.ShowModalAsync(closeRequested => new DuxelAppOptions
+            {
+                Window = new DuxelWindowOptions
+                {
+                    Title = "전송 요청",
+                    Width = 390,
+                    Height = 230,
+                    MinWidth = 350,
+                    MinHeight = 230,
+                    Resizable = false,
+                    ShowMinimizeButton = false,
+                    ShowMaximizeButton = false,
+                    CenterOnScreen = ownerWindowHandle == nint.Zero,
+                    CenterOnOwner = ownerWindowHandle != nint.Zero,
+                    OwnerWindowHandle = ownerWindowHandle,
+                    IconData = IconData,
+                },
+                Renderer = new DuxelRendererOptions { Profile = DuxelPerformanceProfile.Display },
+                Font = new DuxelFontOptions
+                {
+                    FontSize = 14,
+                    FastStartup = false,
+                    StartupGlyphs = SimplyShareGlyphCatalog.All,
+                },
+                Screen = new SimplyShareTransferRequestScreen(request, value =>
+                {
+                    accepted = value;
+                    closeRequested();
+                }),
+            }, ownerWindowHandle);
 
-        return completionSource.Task;
+            if (accepted && !Settings.PairedDeviceIds.Contains(request.SenderDeviceId, StringComparer.Ordinal))
+            {
+                Settings.PairedDeviceIds.Add(request.SenderDeviceId);
+                await _settingsService.SaveAsync();
+            }
+
+            EnqueueUi(() => StatusMessage = accepted
+                ? $"{request.SenderNickname}의 전송 요청을 수락했습니다."
+                : $"{request.SenderNickname}의 전송 요청을 거부했습니다.");
+            return accepted;
+        }
+        finally
+        {
+            _transferPromptLock.Release();
+        }
     }
 
     private void HandleTransferProgressChanged(TransferProgress progress)
@@ -712,7 +947,6 @@ internal sealed class SimplyShareController
 
             ClipboardText = text;
             _clipboardService.SetText(text);
-            SelectedDeviceId ??= device.DeviceId;
             StatusMessage = $"{senderNickname}에게서 텍스트를 받았습니다.";
         });
 
@@ -750,8 +984,11 @@ internal sealed class SimplyShareController
                 OpenChatWindow(device.DeviceId);
             }
 
-            SelectedDeviceId ??= device.DeviceId;
             StatusMessage = $"{senderNickname}에게서 파일 {filePaths.Count}개를 받았습니다.";
+            NativeTrayNotification.Show(
+                Interlocked.CompareExchange(ref _mainWindowHandle, nint.Zero, nint.Zero),
+                "SimplyShare",
+                $"{senderNickname}님과의 수신이 완료되었습니다.");
         });
 
     private void HandlePeerConnected(DeviceInfo device)
@@ -849,6 +1086,20 @@ internal sealed class SimplyShareController
             ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads", "SimplyShare")
             : Path.GetFullPath(Environment.ExpandEnvironmentVariables(path.Trim()));
 
+    private static string FormatFileSize(long bytes)
+    {
+        string[] units = ["B", "KB", "MB", "GB", "TB"];
+        var size = (double)bytes;
+        var unit = 0;
+        while (size >= 1024d && unit < units.Length - 1)
+        {
+            size /= 1024d;
+            unit++;
+        }
+
+        return $"{size:F1} {units[unit]}";
+    }
+
     private static SettingsDraft CloneSettingsDraft(SettingsDraft source)
         => new()
         {
@@ -882,16 +1133,30 @@ internal sealed class SimplyShareController
 
     private async Task SaveSettingsCoreAsync(SettingsDraft sourceDraft, CancellationToken cancellationToken, bool reloadDraftsOnSuccess)
     {
-        Settings.Nickname = sourceDraft.Nickname.Trim();
+        var nickname = sourceDraft.Nickname.Trim();
+        if (nickname.Length is 0)
+        {
+            throw new InvalidOperationException("닉네임을 입력해 주세요.");
+        }
+
+        if (sourceDraft.DiscoveryPort is < 1 or > 65_535 || sourceDraft.TransferPort is < 1 or > 65_535)
+        {
+            throw new InvalidOperationException("포트는 1부터 65535 사이의 값이어야 합니다.");
+        }
+
+        var networkRanges = sourceDraft.NetworkRangesText
+            .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (networkRanges.FirstOrDefault(static range => !NetworkRangeFilter.IsValidPattern(range)) is { } invalidRange)
+        {
+            throw new InvalidOperationException($"올바르지 않은 네트워크 대역입니다: {invalidRange}");
+        }
+
+        Settings.Nickname = nickname;
         Settings.DownloadPath = NormalizePath(sourceDraft.DownloadPath);
         Settings.RunAtStartup = sourceDraft.RunAtStartup;
-        Settings.DiscoveryPort = Math.Clamp(sourceDraft.DiscoveryPort, 1, 65_535);
-        Settings.TransferPort = Math.Clamp(sourceDraft.TransferPort, 1, 65_535);
-        Settings.NetworkRanges =
-        [
-            .. sourceDraft.NetworkRangesText
-                .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-        ];
+        Settings.DiscoveryPort = sourceDraft.DiscoveryPort;
+        Settings.TransferPort = sourceDraft.TransferPort;
+        Settings.NetworkRanges = [.. networkRanges];
 
         Directory.CreateDirectory(Settings.DownloadPath);
         await _settingsService.SaveAsync(cancellationToken);
@@ -917,11 +1182,6 @@ internal sealed class SimplyShareController
 
     private static string? TryGetLocalIpv4(IReadOnlyList<string> networkRanges)
     {
-        if (networkRanges.Count is 0)
-        {
-            return null;
-        }
-
         foreach (var iface in NetworkInterface.GetAllNetworkInterfaces())
         {
             if (iface.OperationalStatus is not OperationalStatus.Up)
@@ -951,8 +1211,55 @@ internal sealed class SimplyShareController
 
         return null;
     }
-}
 
+    private async void OpenTextViewerWindow(string text, nint ownerWindowHandle)
+    {
+        try
+        {
+            await DuxelWindowsApp.ShowModalAsync(closeRequested => new DuxelAppOptions
+            {
+                Window = new DuxelWindowOptions
+                {
+                    Title = "텍스트 보기",
+                    Width = 500,
+                    Height = 400,
+                    MinWidth = 500,
+                    MinHeight = 400,
+                    Resizable = true,
+                    ShowMinimizeButton = false,
+                    ShowMaximizeButton = false,
+                    CenterOnScreen = ownerWindowHandle == nint.Zero,
+                    CenterOnOwner = ownerWindowHandle != nint.Zero,
+                    OwnerWindowHandle = ownerWindowHandle,
+                    IconData = IconData,
+                },
+                Renderer = new DuxelRendererOptions
+                {
+                    Profile = DuxelPerformanceProfile.Display,
+                    MsaaSamples = 0,
+                    FontLinearSampling = false,
+                },
+                Font = new DuxelFontOptions
+                {
+                    FontSize = 14,
+                    FastStartup = false,
+                    StartupGlyphs = SimplyShareGlyphCatalog.All,
+                },
+                Frame = new DuxelFrameOptions
+                {
+                    EnableIdleFrameSkip = true,
+                    LineHeightScale = 1.1f,
+                },
+                Screen = new SimplyShareTextViewerScreen(text, closeRequested),
+            }, ownerWindowHandle);
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Log(nameof(SimplyShareController), $"텍스트 보기 창 열기 실패: {ex}");
+            EnqueueUi(() => StatusMessage = $"텍스트 보기 실패: {ex.Message}");
+        }
+    }
+}
 internal sealed class ChatSessionState
 {
     public string DeviceId = string.Empty;
@@ -977,20 +1284,4 @@ internal sealed class SetupDraft
     public string Nickname = string.Empty;
     public string DownloadPath = string.Empty;
     public string NetworkRangesText = string.Empty;
-}
-
-internal sealed class PendingTransferPrompt
-{
-    private readonly TaskCompletionSource<bool> _completionSource;
-
-    public PendingTransferPrompt(TransferRequest request, TaskCompletionSource<bool> completionSource)
-    {
-        Request = request;
-        _completionSource = completionSource;
-    }
-
-    public TransferRequest Request { get; }
-
-    public void Resolve(bool accepted)
-        => _completionSource.TrySetResult(accepted);
 }

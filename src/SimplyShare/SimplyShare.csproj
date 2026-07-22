@@ -9,7 +9,7 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <RootNamespace>SimplyShare</RootNamespace>
     <AssemblyName>SimplyShare</AssemblyName>
-    <Version>1.0.65</Version>
+    <Version>1.0.70</Version>
     <ApplicationIcon>Assets\app.ico</ApplicationIcon>
 
     <!-- 배포: NativeAOT + Size 최적화 -->
@@ -28,11 +28,7 @@
   <ItemGroup>
     <!-- DI -->
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.*" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <ProjectReference Include="..\..\..\Duxel\src\Duxel.Windows.App\Duxel.Windows.App.csproj" />
-    <ProjectReference Include="..\..\..\Duxel\src\Duxel.Core\Duxel.Core.csproj" />
+    <PackageReference Include="Duxel.Windows.App" Version="0.2.11-preview" />
   </ItemGroup>
 
   <ItemGroup>
@@ -52,43 +48,6 @@
   </ItemGroup>
 
 </Project>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 

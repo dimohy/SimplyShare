@@ -11,30 +11,39 @@ namespace SimplyShare.AppHost;
 
 internal sealed class ChatWindowState : IDisposable
 {
+    private static readonly TimeSpan ConnectionRetryDelay = TimeSpan.FromSeconds(5);
     private readonly ITransferService _transferService;
     private readonly ISettingsService _settingsService;
     private readonly IClipboardService _clipboardService;
     private readonly Action _requestFrame;
     private readonly Action _requestClose;
+    private readonly Action<bool> _remoteUiInterferenceChanged;
+    private readonly Action<bool> _remoteControlStateChanged;
+    private readonly Action _remoteCursorActivity;
     private readonly ConcurrentQueue<Action> _uiActions = new();
     private ChatConnection? _chatConnection;
     private bool _clipboardSubscribed;
     private bool _isConnecting;
-    private bool _isDisposed;
+    private volatile bool _isDisposed;
     private bool _isBoundaryMaster;
     private bool _isPeerClipboardSharingEnabled;
-    private bool _isPeerInputSharingEnabled;
+    private volatile bool _isPeerInputSharingEnabled;
 
     // ── 리모트 입력 ──
     private readonly RawInputHook _rawInputHook = new();
     private readonly GlobalInputHook _globalInputHook = new();
-    private bool _isRemoteInputMode;
-    private bool _isBeingRemoteControlled;
+    private volatile bool _isRemoteInputMode;
+    private volatile bool _isBeingRemoteControlled;
+    private volatile bool _isChatConnected;
+    private volatile bool _isInputSharingEnabled;
     private System.Drawing.Rectangle _boundaryScreenBounds;
     private long _lastInputSendTick;
     private bool _leftCtrlDown;
     private bool _rightCtrlDown;
     private bool _remoteStopInProgress;
+    private int _windowCloseInProgress;
+    private volatile bool _peerLeftChat;
+    private long _lastRemoteCursorActivityTick;
     private Timer? _cursorSuppressTimer;
 
     // ── 입력 채널/배치 ──
@@ -71,6 +80,9 @@ internal sealed class ChatWindowState : IDisposable
         IClipboardService clipboardService,
         Action requestFrame,
         Action requestClose,
+        Action<bool> remoteUiInterferenceChanged,
+        Action<bool> remoteControlStateChanged,
+        Action remoteCursorActivity,
         IEnumerable<ChatMessage>? initialMessages = null)
     {
         TargetDevice = device;
@@ -79,6 +91,9 @@ internal sealed class ChatWindowState : IDisposable
         _clipboardService = clipboardService;
         _requestFrame = requestFrame;
         _requestClose = requestClose;
+        _remoteUiInterferenceChanged = remoteUiInterferenceChanged;
+        _remoteControlStateChanged = remoteControlStateChanged;
+        _remoteCursorActivity = remoteCursorActivity;
 
         BoundarySide = BoundarySide.Right;
         StatusMessage = "연결 대기 중...";
@@ -95,15 +110,15 @@ internal sealed class ChatWindowState : IDisposable
         _inputInjectLoopTask = Task.Run(() => InputInjectLoopAsync(_inputInjectCts.Token));
 
         // 훅 이벤트 바인딩
-        _globalInputHook.KeyDown += vk => OnLocalKey(vk, isDown: true);
-        _globalInputHook.KeyUp += vk => OnLocalKey(vk, isDown: false);
         _rawInputHook.MouseDelta += (dx, dy) => OnLocalMouseDelta(dx, dy);
-        _globalInputHook.MouseWheel += delta => OnLocalMouseWheel(delta);
-        _globalInputHook.MouseDown += button => OnLocalMouseButton(button, isDown: true);
-        _globalInputHook.MouseUp += button => OnLocalMouseButton(button, isDown: false);
+        _rawInputHook.MouseWheel += delta => OnLocalMouseWheel(delta);
+        _rawInputHook.MouseDown += button => OnLocalMouseButton(button, isDown: true);
+        _rawInputHook.MouseUp += button => OnLocalMouseButton(button, isDown: false);
+        _rawInputHook.KeyDown += vk => OnLocalKey(vk, isDown: true);
+        _rawInputHook.KeyUp += vk => OnLocalKey(vk, isDown: false);
 
         _globalInputHook.ShouldBlockInput = () =>
-            IsInputSharingEnabled && ((_isRemoteInputMode && _isPeerInputSharingEnabled) || _isBeingRemoteControlled);
+            IsInputSharingEnabled && (_isRemoteInputMode || _isBeingRemoteControlled);
     }
 
     public DeviceInfo TargetDevice { get; }
@@ -114,11 +129,19 @@ internal sealed class ChatWindowState : IDisposable
 
     public string StatusMessage { get; private set; }
 
-    public bool IsChatConnected { get; private set; }
+    public bool IsChatConnected
+    {
+        get => _isChatConnected;
+        private set => _isChatConnected = value;
+    }
 
     public bool IsClipboardSharingEnabled { get; private set; }
 
-    public bool IsInputSharingEnabled { get; private set; }
+    public bool IsInputSharingEnabled
+    {
+        get => _isInputSharingEnabled;
+        private set => _isInputSharingEnabled = value;
+    }
 
     public string InputModeLabel { get; private set; } = string.Empty;
 
@@ -138,7 +161,7 @@ internal sealed class ChatWindowState : IDisposable
 
     public void EnsureConnected()
     {
-        if (_isDisposed || IsChatConnected || _isConnecting)
+        if (_isDisposed || _peerLeftChat || IsChatConnected || _isConnecting)
         {
             return;
         }
@@ -151,17 +174,37 @@ internal sealed class ChatWindowState : IDisposable
         {
             try
             {
-                var chatConnection = await _transferService.ConnectChatAsync(TargetDevice);
+                var chatConnection = await _transferService.ConnectChatAsync(TargetDevice, _inputSendCts.Token);
                 EnqueueUi(() => AttachConnectionCore(chatConnection, isInitiator: true, startReceiveLoop: true));
+            }
+            catch (OperationCanceledException) when (_inputSendCts.IsCancellationRequested)
+            {
+                // 창 종료 시 연결과 재시도를 함께 중단한다.
             }
             catch (Exception ex)
             {
-                AppLogger.Log(nameof(ChatWindowState), $"채팅 연결 실패: {ex}");
+                AppLogger.Log(nameof(ChatWindowState), $"채팅 연결 실패: {ex.Message}");
                 EnqueueUi(() =>
                 {
-                    StatusMessage = "연결 대기 중...";
-                    _isConnecting = false;
+                    StatusMessage = $"연결 실패 · {ConnectionRetryDelay.TotalSeconds:0}초 후 재시도";
                 });
+
+                try
+                {
+                    await Task.Delay(ConnectionRetryDelay, _inputSendCts.Token);
+                    EnqueueUi(() =>
+                    {
+                        if (!IsChatConnected)
+                        {
+                            _isConnecting = false;
+                            StatusMessage = "연결 재시도 중...";
+                        }
+                    });
+                }
+                catch (OperationCanceledException)
+                {
+                    // 창 종료 시 정상 취소.
+                }
             }
         });
     }
@@ -268,14 +311,7 @@ internal sealed class ChatWindowState : IDisposable
 
     public void BeginSendText()
     {
-        if (!IsChatConnected || _chatConnection is not { IsConnected: true })
-        {
-            StatusMessage = "연결이 준비되면 전송할 수 있습니다.";
-            _requestFrame();
-            return;
-        }
-
-        var text = InputText.Trim();
+        var text = InputText;
         if (text.Length is 0)
         {
             return;
@@ -299,11 +335,20 @@ internal sealed class ChatWindowState : IDisposable
         {
             try
             {
-                await _chatConnection.SendTextAsync(
-                    text,
-                    _settingsService.Settings.Nickname,
-                    _settingsService.Settings.DeviceId,
-                    _settingsService.Settings.TransferPort);
+                if (_chatConnection is { IsConnected: true })
+                {
+                    await _chatConnection.SendTextAsync(
+                        text,
+                        _settingsService.Settings.Nickname,
+                        _settingsService.Settings.DeviceId,
+                        _settingsService.Settings.TransferPort);
+                }
+                else
+                {
+                    await _transferService.SendTextAsync(TargetDevice, text);
+                }
+
+                await PairDeviceAsync();
 
                 EnqueueUi(() =>
                 {
@@ -354,6 +399,7 @@ internal sealed class ChatWindowState : IDisposable
             try
             {
                 await _transferService.SendFilesAsync(TargetDevice, paths);
+                await PairDeviceAsync();
                 EnqueueUi(() => StatusMessage = "파일 전송 완료");
             }
             catch (Exception ex)
@@ -386,6 +432,38 @@ internal sealed class ChatWindowState : IDisposable
     public void RequestClose()
     {
         _requestClose();
+    }
+
+
+    public void BeginCloseFromWindow(NativeWindowHook? windowHook)
+    {
+        if (windowHook is null || Interlocked.CompareExchange(ref _windowCloseInProgress, 1, 0) != 0)
+        {
+            return;
+        }
+
+        _ = CloseFromWindowAsync(windowHook);
+    }
+
+    private async Task CloseFromWindowAsync(NativeWindowHook windowHook)
+    {
+        try
+        {
+            SetInputSharingEnabled(false);
+            SetClipboardSharingEnabled(false);
+
+            if (_chatConnection is { IsConnected: true })
+            {
+                using var cancellationSource = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                await NotifyPeerAndCloseAsync(cancellationSource.Token);
+            }
+
+            windowHook.CloseAfterNotification();
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _windowCloseInProgress, 0);
+        }
     }
 
     private void AttachConnectionCore(ChatConnection chatConnection, bool isInitiator, bool startReceiveLoop)
@@ -482,20 +560,47 @@ internal sealed class ChatWindowState : IDisposable
             _isPeerInputSharingEnabled = preferences.InputSharingEnabled;
             _isPeerClipboardSharingEnabled = preferences.ClipboardSharingEnabled;
             UpdateInputModeLabel();
+
+            if (!_isPeerInputSharingEnabled && (_isRemoteInputMode || _isBeingRemoteControlled))
+            {
+                _ = DisableRemoteControlBothSidesAsync();
+            }
         });
+    }
+
+    private async Task PairDeviceAsync()
+    {
+        var settings = _settingsService.Settings;
+        if (settings.PairedDeviceIds.Contains(TargetDevice.DeviceId, StringComparer.Ordinal))
+        {
+            return;
+        }
+
+        settings.PairedDeviceIds.Add(TargetDevice.DeviceId);
+        await _settingsService.SaveAsync();
     }
 
     private void HandleChatCloseRequested()
     {
         EnqueueUi(() =>
         {
-            Messages.Add(new ChatMessage
+            _peerLeftChat = true;
+            SetInputSharingEnabled(false);
+            SetClipboardSharingEnabled(false);
+            var exitMessage = $"{TargetDevice.Nickname}님이 나갔습니다.";
+            if (!Messages.Any(message => message.Type is ChatMessageType.System && message.Text == exitMessage))
             {
-                Type = ChatMessageType.System,
-                Direction = ChatDirection.Received,
-                Text = $"{TargetDevice.Nickname}님이 대화를 종료했습니다.",
-            });
-            _requestClose();
+                Messages.Add(new ChatMessage
+                {
+                    Type = ChatMessageType.System,
+                    Direction = ChatDirection.Received,
+                    Text = exitMessage,
+                });
+            }
+            IsChatConnected = false;
+            IsBoundarySideEditable = false;
+            StatusMessage = exitMessage;
+            UpdateInputModeLabel();
         });
     }
 
@@ -512,7 +617,9 @@ internal sealed class ChatWindowState : IDisposable
             IsChatConnected = false;
             IsBoundarySideEditable = false;
             IsInputSharingEnabled = false;
-            StatusMessage = "연결 끊김";
+            StatusMessage = _peerLeftChat
+                ? $"{TargetDevice.Nickname}님이 나갔습니다."
+                : "연결 끊김";
             UpdateInputModeLabel();
         });
     }
@@ -647,11 +754,14 @@ internal sealed class ChatWindowState : IDisposable
             _ => BoundarySide.Left,
         };
 
+    private bool CanInputShare
+        => IsInputSharingEnabled && _isPeerInputSharingEnabled && IsChatConnected;
+
     // ── 리모트 입력 모드 ──
 
     private void EnterRemoteMode()
     {
-        if (_isRemoteInputMode)
+        if (_isRemoteInputMode || !CanInputShare)
             return;
 
         _isRemoteInputMode = true;
@@ -659,6 +769,7 @@ internal sealed class ChatWindowState : IDisposable
         CursorVisibility.Hide();
         StartCursorSuppressTimer();
         InputModeLabel = "입력 모드: 원격";
+        NotifyRemoteUiInterferenceChanged();
         _requestFrame();
     }
 
@@ -672,6 +783,7 @@ internal sealed class ChatWindowState : IDisposable
         CursorClipper.Release();
         CursorVisibility.Show();
         InputModeLabel = "입력 모드: 로컬";
+        NotifyRemoteUiInterferenceChanged();
         _requestFrame();
     }
 
@@ -699,7 +811,12 @@ internal sealed class ChatWindowState : IDisposable
             return;
 
         _isBeingRemoteControlled = value;
+        _remoteControlStateChanged(value);
+        NotifyRemoteUiInterferenceChanged();
     }
+
+    private void NotifyRemoteUiInterferenceChanged()
+        => _remoteUiInterferenceChanged(_isRemoteInputMode || _isBeingRemoteControlled);
 
     private bool ShouldEnterRemoteMode(int dx, int dy, int cursorX, int cursorY)
     {
@@ -797,7 +914,7 @@ internal sealed class ChatWindowState : IDisposable
             return;
         }
 
-        if (!IsInputSharingEnabled || !IsChatConnected)
+        if (!CanInputShare)
             return;
 
         if (!_isRemoteInputMode)
@@ -816,7 +933,7 @@ internal sealed class ChatWindowState : IDisposable
         if (_isBeingRemoteControlled)
             return;
 
-        if (!IsInputSharingEnabled || !IsChatConnected)
+        if (!CanInputShare)
             return;
 
         if (!_isRemoteInputMode)
@@ -854,7 +971,7 @@ internal sealed class ChatWindowState : IDisposable
         if (_isBeingRemoteControlled)
             return;
 
-        if (!IsInputSharingEnabled || !IsChatConnected)
+        if (!CanInputShare)
             return;
 
         if (!_isRemoteInputMode)
@@ -873,7 +990,7 @@ internal sealed class ChatWindowState : IDisposable
         if (_isBeingRemoteControlled)
             return;
 
-        if (!IsInputSharingEnabled || !IsChatConnected)
+        if (!CanInputShare)
             return;
 
         if (!_isRemoteInputMode)
@@ -1033,6 +1150,12 @@ internal sealed class ChatWindowState : IDisposable
                     if (hasMouseMove)
                     {
                         TryTriggerRemoteBoundaryReturn(moveDx, moveDy);
+                        var now = Environment.TickCount64;
+                        if (now - _lastRemoteCursorActivityTick >= 16)
+                        {
+                            _lastRemoteCursorActivityTick = now;
+                            _remoteCursorActivity();
+                        }
                     }
                 }
                 catch (Exception ex)

@@ -7,6 +7,13 @@ namespace SimplyShare.Core;
 /// </summary>
 public static class NetworkRangeFilter
 {
+    /// <summary>네트워크 대역 패턴이 네 개의 IPv4 숫자 또는 와일드카드로 구성됐는지 확인합니다.</summary>
+    public static bool IsValidPattern(string pattern)
+    {
+        var parts = pattern.Split('.');
+        return parts.Length is 4 && parts.All(static part => part is "*" || byte.TryParse(part, out _));
+    }
+
     /// <summary>
     /// IP 주소가 지정된 네트워크 대역 목록에 포함되는지 확인
     /// </summary>

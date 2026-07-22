@@ -1,73 +1,64 @@
 using Duxel.Core;
 using SimplyShare.Models;
+using System.Text;
 
 namespace SimplyShare.AppHost;
 
-internal sealed class SimplyShareChatScreen : UiScreen
+internal sealed class SimplyShareChatScreen(ChatWindowState state, Action<string> openTextViewer) : UiScreen
 {
     private static readonly string[] BoundarySideNames = ["오른쪽", "왼쪽", "상단", "하단"];
-    private readonly ChatWindowState _state;
-
-    public SimplyShareChatScreen(ChatWindowState state)
-    {
-        _state = state;
-    }
+    private const string MessagesChildId = "chat-messages";
+    private int _knownMessageCount;
+    private bool _wasAtMessageBottom = true;
+    private bool _scrollToMessageBottom = true;
+    private bool _showScrollToBottom;
 
     public override void Render(UiImmediateContext ui)
     {
-        _state.DrainUiActions();
-        ui.EnableRootViewportContentLayout();
+        state.DrainUiActions();
+        ui.EnableRootViewportContentLayout(contentPadding: 0f);
 
-        var canvas = ui.BeginWindowCanvas(new UiColor(255, 255, 255));
+        var canvas = ui.BeginWindowCanvas(SimplyShareTheme.WindowBackground(ui));
         var draw = ui.GetWindowDrawList();
-
-        var headerHeight = 56f;
-        var helperHeight = 28f;
-        var footerHeight = 84f;
+        const float headerHeight = 52f;
+        const float helperHeight = 23f;
+        var composerInputHeight = GetComposerInputHeight(state.InputText);
+        var footerHeight = composerInputHeight + 16f;
         var headerRect = new UiRect(canvas.X, canvas.Y, canvas.Width, headerHeight);
         var helperRect = new UiRect(canvas.X, canvas.Y + canvas.Height - footerHeight - helperHeight, canvas.Width, helperHeight);
         var footerRect = new UiRect(canvas.X, canvas.Y + canvas.Height - footerHeight, canvas.Width, footerHeight);
-        var messageRect = new UiRect(canvas.X + 4f, headerRect.Y + headerRect.Height, canvas.Width - 8f, helperRect.Y - (headerRect.Y + headerRect.Height));
+        var messageRect = new UiRect(
+            canvas.X + 4f,
+            headerRect.Y + headerRect.Height,
+            MathF.Max(1f, canvas.Width - 8f),
+            MathF.Max(1f, helperRect.Y - (headerRect.Y + headerRect.Height)));
 
-        // Header background
-        draw.AddRectFilled(headerRect, new UiColor(248, 248, 248), ui.WhiteTextureId, headerRect);
-        DrawHorizontalLine(draw, headerRect.Y + headerRect.Height - 1f, headerRect.X, headerRect.Width, SimplyShareTheme.Border, ui.WhiteTextureId);
+        draw.AddRectFilled(headerRect, SimplyShareTheme.Surface(ui), ui.WhiteTextureId, headerRect);
+        DrawHorizontalLine(draw, headerRect.Y + headerRect.Height - 1f, headerRect.X, headerRect.Width, SimplyShareTheme.Border(ui), ui.WhiteTextureId);
+        draw.AddRectFilled(helperRect, SimplyShareTheme.Surface(ui), ui.WhiteTextureId, helperRect);
+        DrawHorizontalLine(draw, helperRect.Y, helperRect.X, helperRect.Width, SimplyShareTheme.Border(ui), ui.WhiteTextureId);
+        draw.AddRectFilled(footerRect, SimplyShareTheme.WindowBackground(ui), ui.WhiteTextureId, footerRect);
+        DrawHorizontalLine(draw, footerRect.Y, footerRect.X, footerRect.Width, SimplyShareTheme.Border(ui), ui.WhiteTextureId);
 
-        // Helper area
-        draw.AddRectFilled(helperRect, new UiColor(248, 248, 248), ui.WhiteTextureId, helperRect);
-        DrawHorizontalLine(draw, helperRect.Y, helperRect.X, helperRect.Width, SimplyShareTheme.Border, ui.WhiteTextureId);
+        RenderHeader(ui, draw, headerRect);
+        RenderMessages(ui, messageRect);
+        ui.DrawTextAligned(helperRect, "파일/폴더를 창에 놓아 전송 · Ctrl+Enter로 전송", SimplyShareTheme.TextSecondary(ui), UiItemHorizontalAlign.Center, UiItemVerticalAlign.Center, 10f);
+        RenderComposer(ui, footerRect);
 
-        // Footer background
-        draw.AddRectFilled(footerRect, new UiColor(250, 250, 250), ui.WhiteTextureId, footerRect);
-        DrawHorizontalLine(draw, footerRect.Y, footerRect.X, footerRect.Width, SimplyShareTheme.Border, ui.WhiteTextureId);
+        ui.EndWindowCanvas();
+        state.EnsureConnected();
+    }
 
-        // Header left: status dot + nickname + IP
-        var dotColor = _state.TargetDevice.IsOnline ? SimplyShareTheme.StatusOnline : SimplyShareTheme.StatusOffline;
-        draw.AddCircleFilled(new UiVector2(headerRect.X + 16f, headerRect.Y + 22f), 5f, dotColor, ui.WhiteTextureId);
-
+    private void RenderHeader(UiImmediateContext ui, UiDrawListBuilder draw, UiRect rect)
+    {
+        var dotColor = state.TargetDevice.IsOnline ? SimplyShareTheme.StatusOnline : SimplyShareTheme.StatusOffline;
+        draw.AddCircleFilled(new UiVector2(rect.X + 17f, rect.Y + 25f), 5f, dotColor, ui.WhiteTextureId);
         ui.PushDirectTextFontPaths(SimplyShareTheme.SemiBoldPrimaryFontPath, SimplyShareTheme.SemiBoldSecondaryFontPath);
-        ui.DrawTextAligned(new UiRect(headerRect.X + 28f, headerRect.Y + 10f, 150f, 18f), _state.TargetDevice.Nickname, SimplyShareTheme.TextPrimary, fontSize: 14f);
+        ui.DrawTextAligned(new UiRect(rect.X + 30f, rect.Y + 8f, 134f, 18f), state.TargetDevice.Nickname, SimplyShareTheme.TextPrimary(ui), fontSize: 14f);
         ui.PopDirectTextFontPaths();
-        ui.DrawTextAligned(new UiRect(headerRect.X + 28f, headerRect.Y + 30f, 150f, 14f), _state.TargetDevice.IpAddress, SimplyShareTheme.TextSecondary, fontSize: 10f);
+        ui.DrawTextAligned(new UiRect(rect.X + 30f, rect.Y + 29f, 86f, 14f), state.TargetDevice.IpAddress, SimplyShareTheme.TextSecondary(ui), fontSize: 10f);
 
-        // Header right: checkbox(input) + checkbox(clipboard) + combo(boundary) — right-aligned like WPF
-        var rightEdge = headerRect.X + headerRect.Width - 8f;
-
-        var inputEnabled = _state.IsInputSharingEnabled;
-        ui.SetCursorScreenPos(new UiVector2(rightEdge - 56f, headerRect.Y + 20f));
-        if (ui.Checkbox("입력", ref inputEnabled))
-        {
-            _state.SetInputSharingEnabled(inputEnabled);
-        }
-
-        var clipboardEnabled = _state.IsClipboardSharingEnabled;
-        ui.SetCursorScreenPos(new UiVector2(rightEdge - 130f, headerRect.Y + 20f));
-        if (ui.Checkbox("클립보드", ref clipboardEnabled))
-        {
-            _state.SetClipboardSharingEnabled(clipboardEnabled);
-        }
-
-        var boundaryIndex = _state.BoundarySide switch
+        var boundaryIndex = state.BoundarySide switch
         {
             BoundarySide.Right => 0,
             BoundarySide.Left => 1,
@@ -76,10 +67,32 @@ internal sealed class SimplyShareChatScreen : UiScreen
             _ => 0,
         };
 
-        ui.SetCursorScreenPos(new UiVector2(rightEdge - 220f, headerRect.Y + 16f));
-        if (_state.IsBoundarySideEditable && ui.Combo(ref boundaryIndex, BoundarySideNames, 4, "chat-boundary"))
+        var inputX = rect.X + rect.Width - 65f;
+        var clipboardX = inputX - 100f;
+        var boundaryX = clipboardX - 87f;
+        var inputModeWidth = MathF.Max(1f, boundaryX - (rect.X + 112f) - 8f);
+        if (!string.IsNullOrWhiteSpace(state.InputModeLabel))
         {
-            _state.SetBoundarySide(boundaryIndex switch
+            ui.DrawTextAligned(
+                new UiRect(rect.X + 112f, rect.Y + 28f, inputModeWidth, 14f),
+                state.InputModeLabel,
+                SimplyShareTheme.TextSecondary(ui),
+                UiItemHorizontalAlign.Right,
+                UiItemVerticalAlign.Center,
+                9f);
+        }
+
+        ui.PushFontSize(13f);
+        ui.PushStyleVarY(UiStyleVar.FramePadding, 4f);
+        var controlHeight = ui.GetFrameHeight();
+        var controlY = rect.Y + MathF.Round((rect.Height - controlHeight) * 0.5f);
+
+        ui.SetCursorScreenPos(new UiVector2(boundaryX, controlY));
+        ui.SetNextItemWidth(82f);
+        ui.BeginDisabled(!state.IsBoundarySideEditable);
+        if (ui.Combo(ref boundaryIndex, BoundarySideNames, 4, "chat-boundary"))
+        {
+            state.SetBoundarySide(boundaryIndex switch
             {
                 1 => BoundarySide.Left,
                 2 => BoundarySide.Top,
@@ -87,170 +100,393 @@ internal sealed class SimplyShareChatScreen : UiScreen
                 _ => BoundarySide.Right,
             });
         }
+        ui.EndDisabled();
 
-        // Input mode label — between left info and right controls
-        if (!string.IsNullOrWhiteSpace(_state.InputModeLabel))
+        var clipboardEnabled = state.IsClipboardSharingEnabled;
+        ui.SetCursorScreenPos(new UiVector2(clipboardX, controlY));
+        ui.BeginDisabled(!state.IsChatConnected);
+        if (ui.Checkbox("클립보드", ref clipboardEnabled))
         {
-            ui.DrawTextAligned(new UiRect(headerRect.X + 180f, headerRect.Y + 22f, 80f, 14f), _state.InputModeLabel, SimplyShareTheme.TextSecondary, fontSize: 10f);
+            state.SetClipboardSharingEnabled(clipboardEnabled);
+        }
+        ui.EndDisabled();
+
+        var inputEnabled = state.IsInputSharingEnabled;
+        ui.SetCursorScreenPos(new UiVector2(inputX, controlY));
+        ui.BeginDisabled(!state.IsChatConnected);
+        if (ui.Checkbox("입력", ref inputEnabled))
+        {
+            state.SetInputSharingEnabled(inputEnabled);
+        }
+        ui.EndDisabled();
+
+        ui.PopStyleVar();
+        ui.PopFontSize();
+    }
+
+    private void RenderComposer(UiImmediateContext ui, UiRect rect)
+    {
+        const float horizontalPadding = 8f;
+        const float controlGap = 6f;
+        const float attachWidth = 40f;
+        const float sendWidth = 64f;
+        const float buttonHeight = 40f;
+        var inputHeight = MathF.Max(40f, rect.Height - 16f);
+        var inputY = rect.Y + MathF.Round((rect.Height - inputHeight) * 0.5f);
+        var buttonY = rect.Y + MathF.Round((rect.Height - buttonHeight) * 0.5f);
+        var rightAreaWidth = attachWidth + sendWidth + (controlGap * 2f);
+        var inputWidth = MathF.Max(120f, rect.Width - rightAreaWidth - (horizontalPadding * 2f));
+        ui.SetCursorScreenPos(new UiVector2(rect.X + horizontalPadding, inputY));
+        ui.SetNextItemWidth(inputWidth);
+        ui.InputTextMultiline("##chat-input", ref state.InputText, 4_096, inputHeight);
+        ui.SetItemDefaultFocus();
+        var inputFocused = ui.IsItemFocused();
+
+        if (inputFocused && ui.Shortcut(UiKey.Enter, KeyModifiers.Ctrl))
+        {
+            state.BeginSendText();
         }
 
-        // Messages
-        RenderMessages(ui, messageRect);
-
-        // Helper text
-        ui.DrawTextAligned(helperRect, "파일을 드래그하여 전송 · Ctrl+Enter로 전송", new UiColor(170, 170, 170), UiItemHorizontalAlign.Center, UiItemVerticalAlign.Center, 10f);
-
-        // Footer: input textbox + buttons
-        ui.SetCursorScreenPos(new UiVector2(footerRect.X + 8f, footerRect.Y + 8f));
-        ui.InputTextMultiline("##chat-input", ref _state.InputText, 4_096, 60f);
-
-        ui.SetCursorScreenPos(new UiVector2(footerRect.X + footerRect.Width - 98f, footerRect.Y + 46f));
-        if (ui.Button("전송", new UiVector2(58f, 30f)))
-        {
-            _state.BeginSendText();
-        }
-
-        ui.SetCursorScreenPos(new UiVector2(footerRect.X + footerRect.Width - 138f, footerRect.Y + 46f));
-        if (ui.Button("📎", new UiVector2(32f, 30f)))
+        var attachRect = new UiRect(rect.X + rect.Width - sendWidth - attachWidth - controlGap - horizontalPadding, buttonY, attachWidth, buttonHeight);
+        ui.SetCursorScreenPos(new UiVector2(attachRect.X, attachRect.Y));
+        var attachPressed = ui.InvisibleButton("chat-attach", new UiVector2(attachRect.Width, attachRect.Height));
+        var attachHovered = ui.IsItemHovered();
+        var attachActive = ui.IsItemActive();
+        if (attachPressed)
         {
             var selectedFiles = NativeFileDialog.PickFiles("전송할 파일 선택");
             if (selectedFiles.Count > 0)
             {
-                _state.BeginSendFiles(selectedFiles);
+                state.BeginSendFiles(selectedFiles);
             }
         }
+        DrawAttachButton(ui, attachRect, attachHovered, attachActive, enabled: true);
 
-        ui.EndWindowCanvas();
-        _state.EnsureConnected();
+        ui.SetCursorScreenPos(new UiVector2(rect.X + rect.Width - sendWidth - horizontalPadding, buttonY));
+        if (ui.Button("전송", new UiVector2(sendWidth, buttonHeight)))
+        {
+            state.BeginSendText();
+        }
     }
 
     private void RenderMessages(UiImmediateContext ui, UiRect messageRect)
     {
-        var draw = ui.GetWindowDrawList();
-        ui.SetCursorScreenPos(new UiVector2(messageRect.X, messageRect.Y));
-        _ = ui.BeginChild("chat-messages", new UiVector2(messageRect.Width, messageRect.Height), border: false);
-
-        foreach (var message in _state.Messages)
+        if (state.Messages.Count != _knownMessageCount)
         {
-            var start = ui.GetCursorScreenPos();
-
-            if (message.Type is ChatMessageType.System)
+            if (_wasAtMessageBottom)
             {
-                var systemRect = new UiRect(messageRect.X + 60f, start.Y + 4f, messageRect.Width - 120f, 16f);
-                ui.DrawTextAligned(systemRect, message.Text ?? string.Empty, new UiColor(170, 170, 170), UiItemHorizontalAlign.Center, UiItemVerticalAlign.Center, 10f);
-                ui.Dummy(new UiVector2(messageRect.Width, 24f));
-                continue;
-            }
-
-            const float maxBubbleWidth = 300f;
-            const float bubblePadX = 10f;
-            const float bubblePadY = 6f;
-            const float bubbleMarginOuter = 4f;
-            const float bubbleMarginInner = 60f;
-
-            if (message.Type is ChatMessageType.Text)
-            {
-                var wrappedText = WrapText(message.Text ?? string.Empty, 28);
-                var lineCount = Math.Max(1, wrappedText.Split('\n').Length);
-                var textHeight = lineCount * 18f;
-                var bubbleHeight = textHeight + bubblePadY * 2f;
-                var bubbleWidth = MathF.Min(maxBubbleWidth, messageRect.Width - bubbleMarginOuter - bubbleMarginInner);
-                var bubbleX = message.Direction is ChatDirection.Sent
-                    ? messageRect.X + messageRect.Width - bubbleWidth - bubbleMarginOuter
-                    : messageRect.X + bubbleMarginOuter;
-                var bubbleRect = new UiRect(bubbleX, start.Y + 2f, bubbleWidth, bubbleHeight);
-                var bubbleColor = message.Direction is ChatDirection.Sent ? SimplyShareTheme.BubbleSent : SimplyShareTheme.BubbleReceived;
-                draw.AddRectFilled(bubbleRect, bubbleColor, ui.WhiteTextureId, messageRect);
-
-                ui.DrawTextAligned(new UiRect(bubbleRect.X + bubblePadX, bubbleRect.Y + bubblePadY, bubbleRect.Width - bubblePadX * 2f, bubbleRect.Height - bubblePadY * 2f), wrappedText, SimplyShareTheme.TextPrimary, fontSize: 13f);
-
-                var timestampRect = message.Direction is ChatDirection.Sent
-                    ? new UiRect(bubbleRect.X + bubbleRect.Width - 44f, bubbleRect.Y + bubbleRect.Height + 1f, 40f, 12f)
-                    : new UiRect(bubbleRect.X + 4f, bubbleRect.Y + bubbleRect.Height + 1f, 40f, 12f);
-                ui.DrawTextAligned(timestampRect, message.Timestamp.ToString("HH:mm"), new UiColor(170, 170, 170), fontSize: 9f);
-
-                ui.Dummy(new UiVector2(messageRect.Width, bubbleRect.Height + 16f));
+                _scrollToMessageBottom = true;
             }
             else
             {
-                // File message
-                var bubbleHeight = 52f;
-                var bubbleWidth = MathF.Min(246f, messageRect.Width - bubbleMarginOuter - bubbleMarginInner);
-                var bubbleX = message.Direction is ChatDirection.Sent
-                    ? messageRect.X + messageRect.Width - bubbleWidth - bubbleMarginOuter
-                    : messageRect.X + bubbleMarginOuter;
-                var bubbleRect = new UiRect(bubbleX, start.Y + 2f, bubbleWidth, bubbleHeight);
-                var bubbleColor = message.Direction is ChatDirection.Sent ? SimplyShareTheme.BubbleSent : SimplyShareTheme.BubbleReceived;
-                draw.AddRectFilled(bubbleRect, bubbleColor, ui.WhiteTextureId, messageRect);
+                _showScrollToBottom = true;
+            }
 
-                ui.DrawTextAligned(new UiRect(bubbleRect.X + 10f, bubbleRect.Y + 6f, 24f, 24f), "📎", SimplyShareTheme.TextPrimary, UiItemHorizontalAlign.Left, UiItemVerticalAlign.Top, 18f);
+            _knownMessageCount = state.Messages.Count;
+        }
 
-                ui.PushDirectTextFontPaths(SimplyShareTheme.SemiBoldPrimaryFontPath, SimplyShareTheme.SemiBoldSecondaryFontPath);
-                ui.DrawTextAligned(new UiRect(bubbleRect.X + 36f, bubbleRect.Y + 6f, bubbleRect.Width - 46f, 18f), message.FileName ?? string.Empty, SimplyShareTheme.TextPrimary, fontSize: 12f);
-                ui.PopDirectTextFontPaths();
+        var draw = ui.GetWindowDrawList();
+        ui.SetCursorScreenPos(new UiVector2(messageRect.X, messageRect.Y));
+        _ = ui.BeginChild(MessagesChildId, new UiVector2(messageRect.Width, messageRect.Height), border: false);
+        var contentOrigin = ui.GetCursorScreenPos();
+        var contentWidth = MathF.Max(1f, ui.GetContentRegionAvail().X - 12f);
 
-                ui.DrawTextAligned(new UiRect(bubbleRect.X + 36f, bubbleRect.Y + 26f, bubbleRect.Width - 46f, 14f), FormatFileSize(message.FileSize), new UiColor(119, 119, 119), fontSize: 10f);
+        foreach (var message in state.Messages)
+        {
+            var start = ui.GetCursorScreenPos();
+            if (message.Type is ChatMessageType.System)
+            {
+                var systemRect = new UiRect(contentOrigin.X + 28f, start.Y + 5f, MathF.Max(1f, contentWidth - 56f), 16f);
+                ui.DrawTextAligned(systemRect, message.Text ?? string.Empty, SimplyShareTheme.TextSecondary(ui), UiItemHorizontalAlign.Center, UiItemVerticalAlign.Center, 10f);
+                ui.SetCursorScreenPos(new UiVector2(contentOrigin.X, start.Y + 28f));
+                continue;
+            }
 
-                if (message.Direction is ChatDirection.Received && !string.IsNullOrWhiteSpace(message.FilePath))
+            const float bubblePadX = 10f;
+            const float bubblePadY = 6f;
+            const float bubbleMarginOuter = 6f;
+            if (message.Type is ChatMessageType.Text)
+            {
+                var maxTextWidth = MathF.Max(56f, MathF.Min(280f, contentWidth - 88f));
+                var wrapped = WrapText(ui, message.Text ?? string.Empty, maxTextWidth, 5);
+                var textBubbleWidth = Math.Clamp(wrapped.Width + (bubblePadX * 2f), 52f, MathF.Min(300f, contentWidth - 68f));
+                var textBubbleX = message.Direction is ChatDirection.Sent
+                    ? contentOrigin.X + contentWidth - textBubbleWidth - bubbleMarginOuter
+                    : contentOrigin.X + bubbleMarginOuter;
+                var bubbleHeight = (wrapped.LineCount * 18f) + (bubblePadY * 2f);
+                var bubbleRect = new UiRect(textBubbleX, start.Y + 2f, textBubbleWidth, bubbleHeight);
+
+                ui.SetCursorScreenPos(new UiVector2(bubbleRect.X, bubbleRect.Y));
+                _ = ui.InvisibleButton($"text-message##{message.Id}", new UiVector2(bubbleRect.Width, bubbleRect.Height));
+                if (ui.IsItemHovered() && ui.IsMouseDoubleClicked((int)UiMouseButton.Left))
                 {
-                    ui.DrawTextAligned(new UiRect(bubbleRect.X + 36f, bubbleRect.Y + 38f, bubbleRect.Width - 46f, 12f), "클릭하여 열기", new UiColor(30, 144, 255), fontSize: 9f);
-                    ui.SetCursorScreenPos(new UiVector2(bubbleRect.X, bubbleRect.Y));
-                    if (ui.InvisibleButton($"open-file##{message.Id}", new UiVector2(bubbleRect.Width, bubbleRect.Height)))
-                    {
-                        _state.OpenReceivedFile(message.FilePath);
-                    }
+                    openTextViewer(message.Text ?? string.Empty);
                 }
 
-                var timestampRect = message.Direction is ChatDirection.Sent
-                    ? new UiRect(bubbleRect.X + bubbleRect.Width - 44f, bubbleRect.Y + bubbleRect.Height + 1f, 40f, 12f)
-                    : new UiRect(bubbleRect.X + 4f, bubbleRect.Y + bubbleRect.Height + 1f, 40f, 12f);
-                ui.DrawTextAligned(timestampRect, message.Timestamp.ToString("HH:mm"), new UiColor(170, 170, 170), fontSize: 9f);
+                DrawMessageBubble(draw, bubbleRect, GetBubbleColor(ui, message), message.Direction, ui.WhiteTextureId, messageRect);
+                ui.DrawTextAligned(
+                    new UiRect(bubbleRect.X + bubblePadX, bubbleRect.Y + bubblePadY, bubbleRect.Width - (bubblePadX * 2f), bubbleRect.Height - (bubblePadY * 2f)),
+                    wrapped.Text,
+                    SimplyShareTheme.TextPrimary(ui),
+                    fontSize: 13f);
+                DrawTimestamp(ui, message, bubbleRect);
+                ui.SetCursorScreenPos(new UiVector2(contentOrigin.X, bubbleRect.Y + bubbleRect.Height + 17f));
+                continue;
+            }
 
-                ui.Dummy(new UiVector2(messageRect.Width, bubbleRect.Height + 16f));
+            const float fileBubbleHeight = 56f;
+            var fileTextWidth = ui.CalcTextSize(message.FileName ?? string.Empty, 12f).X;
+            var fileBubbleWidth = Math.Clamp(fileTextWidth + 58f, 176f, MathF.Min(300f, contentWidth - 68f));
+            var fileBubbleX = message.Direction is ChatDirection.Sent
+                ? contentOrigin.X + contentWidth - fileBubbleWidth - bubbleMarginOuter
+                : contentOrigin.X + bubbleMarginOuter;
+            var fileRect = new UiRect(fileBubbleX, start.Y + 2f, fileBubbleWidth, fileBubbleHeight);
+            ui.SetCursorScreenPos(new UiVector2(fileRect.X, fileRect.Y));
+            var filePressed = ui.InvisibleButton($"file-message##{message.Id}", new UiVector2(fileRect.Width, fileRect.Height));
+            if (filePressed && message.Direction is ChatDirection.Received && !string.IsNullOrWhiteSpace(message.FilePath))
+            {
+                state.OpenReceivedFile(message.FilePath);
+            }
+
+            DrawMessageBubble(draw, fileRect, GetBubbleColor(ui, message), message.Direction, ui.WhiteTextureId, messageRect);
+            DrawPaperclip(draw, new UiVector2(fileRect.X + 21f, fileRect.Y + 22f), SimplyShareTheme.TextPrimary(ui), 1.7f);
+            var fileName = FitTextToWidth(ui, message.FileName ?? string.Empty, MathF.Max(1f, fileRect.Width - 50f), 12f);
+            ui.PushDirectTextFontPaths(SimplyShareTheme.SemiBoldPrimaryFontPath, SimplyShareTheme.SemiBoldSecondaryFontPath);
+            ui.DrawTextAligned(new UiRect(fileRect.X + 40f, fileRect.Y + 7f, fileRect.Width - 50f, 18f), fileName, SimplyShareTheme.TextPrimary(ui), fontSize: 12f);
+            ui.PopDirectTextFontPaths();
+            ui.DrawTextAligned(new UiRect(fileRect.X + 40f, fileRect.Y + 27f, fileRect.Width - 50f, 14f), FormatFileSize(message.FileSize), SimplyShareTheme.TextSecondary(ui), fontSize: 10f);
+            if (message.Direction is ChatDirection.Received && !string.IsNullOrWhiteSpace(message.FilePath))
+            {
+                ui.DrawTextAligned(new UiRect(fileRect.X + 40f, fileRect.Y + 40f, fileRect.Width - 50f, 12f), "클릭하여 열기", ui.GetColorU32(UiStyleColor.CheckMark), fontSize: 9f);
+            }
+            DrawTimestamp(ui, message, fileRect);
+            ui.SetCursorScreenPos(new UiVector2(contentOrigin.X, fileRect.Y + fileRect.Height + 17f));
+        }
+
+        if (_scrollToMessageBottom)
+        {
+            ui.SetScrollY(ui.GetScrollMaxY());
+            _scrollToMessageBottom = false;
+            _wasAtMessageBottom = true;
+            _showScrollToBottom = false;
+        }
+        else
+        {
+            var maximumScroll = ui.GetScrollMaxY();
+            _wasAtMessageBottom = maximumScroll <= 0f || ui.GetScrollY() >= maximumScroll - 4f;
+            if (_wasAtMessageBottom)
+            {
+                _showScrollToBottom = false;
             }
         }
 
         ui.EndChild();
+
+        if (_showScrollToBottom)
+        {
+            const float buttonWidth = 36f;
+            const float buttonHeight = 28f;
+            ui.SetCursorScreenPos(new UiVector2(
+                messageRect.X + messageRect.Width - buttonWidth - 14f,
+                messageRect.Y + messageRect.Height - buttonHeight - 12f));
+            if (ui.Button("↓##scroll-chat-bottom", new UiVector2(buttonWidth, buttonHeight)))
+            {
+                _scrollToMessageBottom = true;
+            }
+        }
     }
 
-    private static void DrawHorizontalLine(UiDrawListBuilder draw, float y, float x, float width, UiColor color, UiTextureId textureId)
-        => draw.AddRectFilled(new UiRect(x, y, width, 1f), color, textureId);
+    private static UiColor GetBubbleColor(UiImmediateContext ui, ChatMessage message)
+        => message.Direction is ChatDirection.Sent ? SimplyShareTheme.BubbleSent(ui) : SimplyShareTheme.BubbleReceived(ui);
 
-    private static string WrapText(string text, int maxCharsPerLine)
+    private static void DrawTimestamp(UiImmediateContext ui, ChatMessage message, UiRect bubbleRect)
     {
-        if (string.IsNullOrWhiteSpace(text) || text.Length <= maxCharsPerLine)
+        var timestampRect = message.Direction is ChatDirection.Sent
+            ? new UiRect(bubbleRect.X + bubbleRect.Width - 44f, bubbleRect.Y + bubbleRect.Height + 1f, 40f, 12f)
+            : new UiRect(bubbleRect.X + 4f, bubbleRect.Y + bubbleRect.Height + 1f, 40f, 12f);
+        ui.DrawTextAligned(timestampRect, message.Timestamp.ToString("HH:mm"), SimplyShareTheme.TextSecondary(ui), fontSize: 9f);
+    }
+
+    private static WrappedText WrapText(UiImmediateContext ui, string text, float maxWidth, int maxLines)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            return new WrappedText(string.Empty, 1, 0f);
+        }
+
+        var lines = new List<string>(maxLines);
+        var current = new StringBuilder();
+        var truncated = false;
+        for (var index = 0; index < text.Length; index++)
+        {
+            var character = text[index];
+            if (character == '\r')
+            {
+                continue;
+            }
+
+            if (character == '\n')
+            {
+                lines.Add(current.ToString());
+                current.Clear();
+                if (lines.Count == maxLines)
+                {
+                    truncated = index < text.Length - 1;
+                    break;
+                }
+
+                continue;
+            }
+
+            current.Append(character);
+            if (current.Length > 1 && ui.CalcTextSize(current.ToString(), 13f).X > maxWidth)
+            {
+                current.Length--;
+                lines.Add(current.ToString());
+                current.Clear();
+                current.Append(character);
+                if (lines.Count == maxLines)
+                {
+                    truncated = true;
+                    break;
+                }
+            }
+        }
+
+        if (!truncated && current.Length > 0 && lines.Count < maxLines)
+        {
+            lines.Add(current.ToString());
+        }
+
+        if (lines.Count == 0)
+        {
+            lines.Add(string.Empty);
+        }
+
+        if (truncated)
+        {
+            var lastLine = lines[^1];
+            while (lastLine.Length > 0 && ui.CalcTextSize($"{lastLine}…", 13f).X > maxWidth)
+            {
+                lastLine = lastLine[..^1];
+            }
+
+            lines[^1] = $"{lastLine}…";
+        }
+
+        var width = lines.Select(line => ui.CalcTextSize(line, 13f).X).DefaultIfEmpty(0f).Max();
+        return new WrappedText(string.Join('\n', lines), lines.Count, width);
+    }
+
+    private readonly record struct WrappedText(string Text, int LineCount, float Width);
+
+    private static float GetComposerInputHeight(string text)
+    {
+        var lineCount = 1;
+        foreach (var character in text)
+        {
+            if (character == '\n')
+            {
+                lineCount++;
+            }
+        }
+
+        return Math.Clamp((lineCount * 18f) + 16f, 40f, 100f);
+    }
+
+    private static string FitTextToWidth(UiImmediateContext ui, string text, float maxWidth, float fontSize)
+    {
+        if (ui.CalcTextSize(text, fontSize).X <= maxWidth)
         {
             return text;
         }
 
-        var lines = new List<string>();
-        var current = new List<char>(maxCharsPerLine);
-
-        foreach (var ch in text)
+        var length = text.Length;
+        while (length > 0 && ui.CalcTextSize($"{text[..length]}…", fontSize).X > maxWidth)
         {
-            if (ch == '\n')
-            {
-                lines.Add(new string([.. current]));
-                current.Clear();
-                continue;
-            }
-
-            current.Add(ch);
-            if (current.Count < maxCharsPerLine)
-            {
-                continue;
-            }
-
-            lines.Add(new string([.. current]));
-            current.Clear();
+            length--;
         }
 
-        if (current.Count > 0)
+        return length > 0 ? $"{text[..length]}…" : "…";
+    }
+
+    private static void DrawAttachButton(
+        UiImmediateContext ui,
+        UiRect rect,
+        bool hovered,
+        bool active,
+        bool enabled)
+    {
+        var draw = ui.GetWindowDrawList();
+        if (hovered || active)
         {
-            lines.Add(new string([.. current]));
+            var background = active
+                ? ui.GetColorU32(UiStyleColor.ButtonActive)
+                : ui.GetColorU32(UiStyleColor.ButtonHovered);
+            DrawRoundedRectFilled(draw, rect, background, rect.Width * 0.5f, ui.WhiteTextureId, rect);
         }
 
-        return string.Join('\n', lines);
+        var iconColor = enabled
+            ? SimplyShareTheme.TextPrimary(ui)
+            : SimplyShareTheme.TextSecondary(ui);
+        DrawPaperclip(draw, new UiVector2(rect.X + (rect.Width * 0.5f), rect.Y + (rect.Height * 0.5f)), iconColor, 1.8f);
+    }
+
+    private static void DrawPaperclip(UiDrawListBuilder draw, UiVector2 center, UiColor color, float thickness)
+    {
+        draw.AddLine(new UiVector2(center.X - 6f, center.Y + 4f), new UiVector2(center.X + 4f, center.Y - 6f), color, thickness);
+        draw.AddLine(new UiVector2(center.X - 2f, center.Y + 7f), new UiVector2(center.X + 7f, center.Y - 2f), color, thickness);
+        draw.AddLine(new UiVector2(center.X - 6f, center.Y + 4f), new UiVector2(center.X - 2f, center.Y + 7f), color, thickness);
+        draw.AddLine(new UiVector2(center.X + 4f, center.Y - 6f), new UiVector2(center.X + 7f, center.Y - 2f), color, thickness);
+        draw.AddLine(new UiVector2(center.X - 3f, center.Y + 2f), new UiVector2(center.X + 2f, center.Y - 3f), color, thickness);
+    }
+
+    private static void DrawMessageBubble(
+        UiDrawListBuilder draw,
+        UiRect rect,
+        UiColor color,
+        ChatDirection direction,
+        UiTextureId textureId,
+        UiRect clipRect)
+    {
+        const float radius = 10f;
+        DrawRoundedRectFilled(draw, rect, color, radius, textureId, clipRect);
+
+        var squareCorner = direction is ChatDirection.Sent
+            ? new UiRect(rect.X + rect.Width - radius, rect.Y + rect.Height - radius, radius, radius)
+            : new UiRect(rect.X, rect.Y + rect.Height - radius, radius, radius);
+        draw.AddRectFilled(squareCorner, color, textureId, clipRect);
+    }
+
+    private static void DrawRoundedRectFilled(
+        UiDrawListBuilder draw,
+        UiRect rect,
+        UiColor color,
+        float radius,
+        UiTextureId textureId,
+        UiRect clipRect)
+    {
+        var resolvedRadius = MathF.Min(radius, MathF.Min(rect.Width, rect.Height) * 0.5f);
+        if (resolvedRadius <= 0f)
+        {
+            draw.AddRectFilled(rect, color, textureId, clipRect);
+            return;
+        }
+
+        draw.AddRectFilled(
+            new UiRect(rect.X + resolvedRadius, rect.Y, rect.Width - (resolvedRadius * 2f), rect.Height),
+            color,
+            textureId,
+            clipRect);
+        draw.AddRectFilled(
+            new UiRect(rect.X, rect.Y + resolvedRadius, rect.Width, rect.Height - (resolvedRadius * 2f)),
+            color,
+            textureId,
+            clipRect);
+        draw.AddCircleFilled(new UiVector2(rect.X + resolvedRadius, rect.Y + resolvedRadius), resolvedRadius, color, textureId, clipRect, 12);
+        draw.AddCircleFilled(new UiVector2(rect.X + rect.Width - resolvedRadius, rect.Y + resolvedRadius), resolvedRadius, color, textureId, clipRect, 12);
+        draw.AddCircleFilled(new UiVector2(rect.X + resolvedRadius, rect.Y + rect.Height - resolvedRadius), resolvedRadius, color, textureId, clipRect, 12);
+        draw.AddCircleFilled(new UiVector2(rect.X + rect.Width - resolvedRadius, rect.Y + rect.Height - resolvedRadius), resolvedRadius, color, textureId, clipRect, 12);
     }
 
     private static string FormatFileSize(long bytes)
@@ -258,13 +494,15 @@ internal sealed class SimplyShareChatScreen : UiScreen
         string[] units = ["B", "KB", "MB", "GB"];
         double size = bytes;
         var unitIndex = 0;
-
         while (size >= 1024d && unitIndex < units.Length - 1)
         {
             size /= 1024d;
             unitIndex++;
         }
 
-        return unitIndex is 0 ? $"{size:0} {units[unitIndex]}" : $"{size:0.##} {units[unitIndex]}";
+        return unitIndex == 0 ? $"{size:0} {units[unitIndex]}" : $"{size:0.##} {units[unitIndex]}";
     }
+
+    private static void DrawHorizontalLine(UiDrawListBuilder draw, float y, float x, float width, UiColor color, UiTextureId textureId)
+        => draw.AddRectFilled(new UiRect(x, y, width, 1f), color, textureId);
 }

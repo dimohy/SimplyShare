@@ -21,9 +21,13 @@ await controller.InitializeAsync();
 
 try
 {
+    if (!await controller.ShowInitialSetupAsync())
+    {
+        return;
+    }
+
     DuxelWindowsApp.Run(new DuxelAppOptions
     {
-        Theme = SimplyShareTheme.Light,
         Window = new DuxelWindowOptions
         {
             Title = "SimplyShare",
@@ -33,7 +37,7 @@ try
             MinHeight = 480,
             VSync = true,
             Resizable = false,
-            ShowMinimizeButton = false,
+            ShowMinimizeButton = true,
             ShowMaximizeButton = false,
             CenterOnScreen = true,
             IconData = appIconData,

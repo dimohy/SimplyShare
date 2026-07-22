@@ -32,13 +32,13 @@ public sealed class GlobalInputHook : IDisposable
         _mouseProc = MouseHookCallback;
         _keyboardProc = KeyboardHookCallback;
 
-        var hModule = GetModuleHandle(null);
-
-        _mouseHook = SetWindowsHookEx(WH_MOUSE_LL, _mouseProc, hModule, 0);
+        // 저수준 훅은 호출 프로세스의 스레드에서 실행된다. Native AOT의 역호출
+        // thunk는 PE 모듈에 내장된 훅 프로시저가 아니므로 hMod를 반드시 NULL로 둔다.
+        _mouseHook = SetWindowsHookEx(WH_MOUSE_LL, _mouseProc, nint.Zero, 0);
         if (_mouseHook == 0)
             throw new InvalidOperationException($"SetWindowsHookEx(WH_MOUSE_LL) 실패: {Marshal.GetLastWin32Error()}");
 
-        _keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, _keyboardProc, hModule, 0);
+        _keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, _keyboardProc, nint.Zero, 0);
         if (_keyboardHook == 0)
         {
             var err = Marshal.GetLastWin32Error();
@@ -64,13 +64,14 @@ public sealed class GlobalInputHook : IDisposable
 
     private nint MouseHookCallback(int nCode, nint wParam, nint lParam)
     {
-        var shouldBlock = ShouldBlockInput?.Invoke() is true;
+        var shouldBlock = false;
         var isInjectedBySimplyShare = false;
         var msg = 0;
 
-        if (nCode >= 0)
+        try
         {
-            try
+            shouldBlock = ShouldBlockInput?.Invoke() is true;
+            if (nCode >= 0)
             {
                 var info = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
                 isInjectedBySimplyShare = info.dwExtraInfo == InputInjector.InjectedExtraInfo;
@@ -115,10 +116,10 @@ public sealed class GlobalInputHook : IDisposable
                         }
                 }
             }
-            catch
-            {
-                // 훅 콜백은 예외 전파 금지
-            }
+        }
+        catch
+        {
+            // Native AOT 역호출 경계에서는 어떤 예외도 전파하지 않는다.
         }
 
         if (shouldBlock && !isInjectedBySimplyShare)
@@ -131,12 +132,13 @@ public sealed class GlobalInputHook : IDisposable
 
     private nint KeyboardHookCallback(int nCode, nint wParam, nint lParam)
     {
-        var shouldBlock = ShouldBlockInput?.Invoke() is true;
+        var shouldBlock = false;
         var isInjectedBySimplyShare = false;
 
-        if (nCode >= 0)
+        try
         {
-            try
+            shouldBlock = ShouldBlockInput?.Invoke() is true;
+            if (nCode >= 0)
             {
                 var info = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
                 isInjectedBySimplyShare = info.dwExtraInfo == InputInjector.InjectedExtraInfo;
@@ -155,10 +157,10 @@ public sealed class GlobalInputHook : IDisposable
                         break;
                 }
             }
-            catch
-            {
-                // 훅 콜백은 예외 전파 금지
-            }
+        }
+        catch
+        {
+            // Native AOT 역호출 경계에서는 어떤 예외도 전파하지 않는다.
         }
 
         if (shouldBlock && !isInjectedBySimplyShare)
@@ -176,6 +178,7 @@ public sealed class GlobalInputHook : IDisposable
         _keyboardProc = null;
     }
 
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
     private delegate nint HookProc(int nCode, nint wParam, nint lParam);
 
     private const int WH_MOUSE_LL = 14;
@@ -230,8 +233,5 @@ public sealed class GlobalInputHook : IDisposable
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern nint CallNextHookEx(nint hhk, int nCode, nint wParam, nint lParam);
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
-    private static extern nint GetModuleHandle(string? lpModuleName);
 
 }
